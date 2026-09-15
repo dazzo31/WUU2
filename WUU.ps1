@@ -650,12 +650,26 @@ function Get-RemoteCredentials {
 # Helper function: Execute CIM command with timeout (prevents hangs)
 function Invoke-CimWithTimeout {
     param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
         [string]$ComputerName,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
         [string]$ClassName = 'Win32_ComputerSystem',
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(1, 300)]
         [int]$TimeoutSeconds = 5,
+        
+        [Parameter(Mandatory=$false)]
         [PSCredential]$Credential = $null,
+        
+        [Parameter(Mandatory=$false)]
         [string]$Operation = 'CIM operation'
     )
+    
+    $cimJob = $null
     
     try {
         $cimJob = Start-Job -ScriptBlock {
@@ -677,30 +691,49 @@ function Invoke-CimWithTimeout {
         $jobCompleted = Wait-Job -Job $cimJob -Timeout $TimeoutSeconds
         if ($jobCompleted) {
             $cimResult = Receive-Job -Job $cimJob
-            Remove-Job -Job $cimJob -Force -ErrorAction SilentlyContinue
-            if ($cimResult.Success) {
+            if ($cimResult -and $cimResult.Success) {
                 return @{ Success = $true; Result = $cimResult.Result }
             } else {
-                return @{ Success = $false; Error = $cimResult.Error }
+                $errorMsg = if ($cimResult -and $cimResult.Error) { $cimResult.Error } else { 'Unknown error' }
+                return @{ Success = $false; Error = $errorMsg }
             }
         } else {
-            Remove-Job -Job $cimJob -Force -ErrorAction SilentlyContinue
             return @{ Success = $false; Error = "$Operation timed out after $TimeoutSeconds seconds" }
         }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
+    } finally {
+        if ($cimJob) {
+            Remove-Job -Job $cimJob -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
 # Helper function: Execute service command with timeout (prevents hangs)
 function Invoke-ServiceWithTimeout {
     param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
         [string]$ComputerName,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
         [string]$ServiceName = 'wuauserv',
-        [string]$Action = 'Check',  # Check, Start, Stop, Restart
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateSet('Check', 'Start', 'Stop', 'Restart')]
+        [string]$Action = 'Check',
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(1, 300)]
         [int]$TimeoutSeconds = 5,
-        [int]$PostActionDelay = 5  # Seconds to wait after action
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(0, 60)]
+        [int]$PostActionDelay = 5
     )
+    
+    $serviceJob = $null
     
     try {
         $serviceJob = Start-Job -ScriptBlock {
@@ -732,7 +765,11 @@ function Invoke-ServiceWithTimeout {
                     }
                 }
                 
-                return @{ Success = $success; Service = $service; Status = $service.Status }
+                if ($service) {
+                    return @{ Success = $success; Service = $service; Status = $service.Status }
+                } else {
+                    return @{ Success = $false; Error = "Service not found or inaccessible" }
+                }
             } catch {
                 return @{ Success = $false; Error = $_.Exception.Message }
             }
@@ -741,14 +778,20 @@ function Invoke-ServiceWithTimeout {
         $jobCompleted = Wait-Job -Job $serviceJob -Timeout $TimeoutSeconds
         if ($jobCompleted) {
             $serviceResult = Receive-Job -Job $serviceJob
-            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
-            return $serviceResult
+            if ($serviceResult) {
+                return $serviceResult
+            } else {
+                return @{ Success = $false; Error = 'No result returned from job' }
+            }
         } else {
-            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
             return @{ Success = $false; Error = "Service $Action timed out after $TimeoutSeconds seconds" }
         }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
+    } finally {
+        if ($serviceJob) {
+            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
@@ -2977,7 +3020,10 @@ $GetUpdates = {
                 }
                 
                 $wmiTest = $null
-                if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
+                $wmiSuccess = $false
+                
+                try {
+                    if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Using localhost WMI connection"
@@ -2994,29 +3040,25 @@ $GetUpdates = {
                     
                     $wmiResult = Invoke-CimWithTimeout -ComputerName $Computer.computer -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Operation 'WMI connectivity test'
                     
-                    if ($wmiResult.Success) {
-                        $wmiTest = $wmiResult.Result
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] WMI test successful"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
+                        if ($wmiResult -and $wmiResult.Success) {
+                            $wmiTest = $wmiResult.Result
+                            $wmiSuccess = $true
+                            if ($EnableDebugLogging) {
+                                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+                                $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] WMI test successful"
+                                Add-Content -Path $LogPath -Value $logEntry -Force
+                            }
+                        } else {
+                            $errorMsg = if ($wmiResult -and $wmiResult.Error) { $wmiResult.Error } else { 'Unknown error' }
+                            throw "WMI connectivity test failed: $errorMsg"
                         }
-                    } else {
-                        throw "WMI connectivity test failed: $($wmiResult.Error)"
+                        
+                        # Skip credential-based WMI tests - already tested with default credentials above
                     }
-                    
-                    # Skip credential-based WMI tests - already tested with default credentials above
+                } catch {
+                    $wmiSuccess = $false
+                    throw $_
                 }
-                
-                if ($EnableDebugLogging) {
-                    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                    $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] WMI connectivity test successful"
-                    Add-Content -Path $LogPath -Value $logEntry -Force
-                }
-                
-if (-not $wmiTest) {
-    $errorMessage = "WMI is not accessible on $($Computer.computer). This could indicate network connectivity issues, firewall blocking, or WMI service problems. Suggestions: verify WMI service is running, check firewall WMI exceptions, ensure proper credentials."
-    SafeUpdateListViewItem $Computer.computer @{
         Status = $errorMessage
     }
     throw $errorMessage
@@ -3035,13 +3077,14 @@ if (-not $wmiTest) {
                         # Check Windows Update service status
                         $serviceResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Check' -TimeoutSeconds 5
                         
-                        if ($serviceResult.Success) {
+                        if ($serviceResult -and $serviceResult.Success) {
                             $wuService = $serviceResult.Service
                         } else {
-                            throw "Service check failed: $($serviceResult.Error)"
+                            $errorMsg = if ($serviceResult -and $serviceResult.Error) { $serviceResult.Error } else { 'Unknown error' }
+                            throw "Service check failed: $errorMsg"
                         }
                         
-                        if ($wuService.Status -ne 'Running') {
+                        if ($wuService -and $wuService.Status -ne 'Running') {
                             SafeUpdateListViewItem $Computer.computer @{
                                 Status = "Starting Windows Update service..."
                             }
@@ -3051,7 +3094,7 @@ if (-not $wmiTest) {
                             # Start the service with timeout
                             $startResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Start' -TimeoutSeconds 10 -PostActionDelay 5
                             
-                            if ($startResult.Success) {
+                            if ($startResult -and $startResult.Success) {
                                 $wuService = $startResult.Service
                                 if ($EnableDebugLogging) {
                                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
@@ -3059,7 +3102,8 @@ if (-not $wmiTest) {
                                     Add-Content -Path $LogPath -Value $logEntry -Force
                                 }
                             } else {
-                                throw "Service start failed: $($startResult.Error)"
+                                $errorMsg = if ($startResult -and $startResult.Error) { $startResult.Error } else { 'Unknown error' }
+                                throw "Service start failed: $errorMsg"
                             }
                         }
                     }
