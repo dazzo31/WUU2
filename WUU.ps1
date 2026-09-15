@@ -602,32 +602,70 @@ function Get-RemoteCredentials {
         if ($script:UseCustomCredentials -and $script:CustomCredentials) {
             try {
                 Write-DebugLog "Testing custom credentials for $ComputerName" -Level 'DEBUG'
-                # Test custom credentials with a simple WMI query
-                $testResult = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -Credential $script:CustomCredentials -ErrorAction Stop
-                if ($testResult) {
-                    # Custom credentials work, cache them (runtime cache only)
-                    Write-DebugLog "Custom credentials successful for $ComputerName, caching" -Level 'INFO'
-                    $script:CredentialCache[$ComputerName] = $script:CustomCredentials
-                    return $script:CustomCredentials
+                # Test custom credentials with a simple WMI query (with 5s timeout to prevent hangs)
+                $wmiJob = Start-Job -ScriptBlock {
+                    param($ComputerName, $Cred)
+                    try {
+                        $result = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -Credential $Cred -ErrorAction Stop
+                        return @{ Success = $true; Result = $result }
+                    } catch {
+                        return @{ Success = $false; Error = $_.Exception.Message }
+                    }
+                } -ArgumentList $ComputerName, $script:CustomCredentials
+                
+                $jobCompleted = Wait-Job -Job $wmiJob -Timeout 5
+                if ($jobCompleted) {
+                    $wmiResult = Receive-Job -Job $wmiJob
+                    Remove-Job -Job $wmiJob -Force -ErrorAction SilentlyContinue
+                    if ($wmiResult.Success) {
+                        # Custom credentials work, cache them (runtime cache only)
+                        Write-DebugLog "Custom credentials successful for $ComputerName, caching" -Level 'INFO'
+                        $script:CredentialCache[$ComputerName] = $script:CustomCredentials
+                        return $script:CustomCredentials
+                    } else {
+                        Write-DebugLog "Custom credentials failed for $ComputerName : $($wmiResult.Error)" -Level 'WARN'
+                    }
+                } else {
+                    Write-DebugLog "Custom credentials test timed out for $ComputerName" -Level 'WARN'
+                    Remove-Job -Job $wmiJob -Force -ErrorAction SilentlyContinue
                 }
             } catch {
-                Write-DebugLog "Custom credentials failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
+                Write-DebugLog "Custom credentials test failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
             }
         }
         
         # Custom credentials failed or not configured, try default credentials
         try {
             Write-DebugLog "Testing default credentials for $ComputerName" -Level 'DEBUG'
-            # Test default credentials with a simple WMI query
-            $testResult = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -ErrorAction Stop
-            if ($testResult) {
-                # Default credentials work, cache success (runtime cache only)
-                Write-DebugLog "Default credentials successful for $ComputerName, caching" -Level 'INFO'
-                $script:CredentialCache[$ComputerName] = $null  # null means use default credentials
-                return $null
+            # Test default credentials with a simple WMI query (with 5s timeout to prevent hangs)
+            $wmiJob = Start-Job -ScriptBlock {
+                param($ComputerName)
+                try {
+                    $result = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -ErrorAction Stop
+                    return @{ Success = $true; Result = $result }
+                } catch {
+                    return @{ Success = $false; Error = $_.Exception.Message }
+                }
+            } -ArgumentList $ComputerName
+            
+            $jobCompleted = Wait-Job -Job $wmiJob -Timeout 5
+            if ($jobCompleted) {
+                $wmiResult = Receive-Job -Job $wmiJob
+                Remove-Job -Job $wmiJob -Force -ErrorAction SilentlyContinue
+                if ($wmiResult.Success) {
+                    # Default credentials work, cache success (runtime cache only)
+                    Write-DebugLog "Default credentials successful for $ComputerName, caching" -Level 'INFO'
+                    $script:CredentialCache[$ComputerName] = $null  # null means use default credentials
+                    return $null
+                } else {
+                    Write-DebugLog "Default credentials failed for $ComputerName : $($wmiResult.Error)" -Level 'WARN'
+                }
+            } else {
+                Write-DebugLog "Default credentials test timed out for $ComputerName" -Level 'WARN'
+                Remove-Job -Job $wmiJob -Force -ErrorAction SilentlyContinue
             }
         } catch {
-            Write-DebugLog "Default credentials failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
+            Write-DebugLog "Default credentials test failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
         }
         
         # Both failed - return null to indicate auth failure
