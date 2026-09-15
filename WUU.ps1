@@ -2117,6 +2117,7 @@ function New-ComputerRunspace {
         $newRunspace.SessionStateProxy.SetVariable("CustomCredentials",$script:CustomCredentials)
         $newRunspace.SessionStateProxy.SetVariable("CredentialCache",$script:CredentialCache)
         $newRunspace.SessionStateProxy.SetVariable("PerformanceThreshold",$PerformanceThreshold)
+        $newRunspace.SessionStateProxy.SetVariable("ConfigPaths",$script:ConfigPaths)
         $newRunspace.SessionStateProxy.SetVariable("searchTimeout",$searchTimeout)
         $newRunspace.SessionStateProxy.SetVariable("sessionTimeout",$sessionTimeout)
         $newRunspace.SessionStateProxy.SetVariable("rebootCheckTimeout",$rebootCheckTimeout)
@@ -3143,8 +3144,16 @@ $GetUpdates = {
                     Add-Content -Path $LogPath -Value $logEntry -Force
                 }
                 
-                $pingResult = Test-Connection -ComputerName $Computer.computer -Count 1 -Quiet -TimeoutSeconds 2
-                if (-not $pingResult) {
+                # Ping test (PS 5.1-compatible; -TimeoutSeconds is a PS6+ parameter)
+                $pingOk = $false
+                try {
+                    $pingResult = New-Object System.Net.NetworkInformation.Ping
+                    $pingReply = $pingResult.Send($Computer.computer, 2000)
+                    $pingOk = ($pingReply.Status -eq 'Success')
+                } catch {
+                    $pingOk = $false
+                }
+                if (-not $pingOk) {
                     $errorMessage = "Computer $($Computer.computer) is not reachable (ping timeout after 2s). Check network connectivity, firewall ICMP rules, or verify the computer exists."
                     $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                         $uiHash.Listview.Items.EditItem($Computer)
@@ -3601,44 +3610,10 @@ $GetUpdates = {
     }
 }
 
-#Format errors for Out-GridView
-$GetErrors = {
-    ForEach ($err in $error) {
-        Switch ($err) {
-            {$err -is [System.Management.Automation.ErrorRecord]} {
-                    $hash = @{
-                    Category = $err.categoryinfo.Category
-                    Activity = $err.categoryinfo.Activity
-                    Reason = $err.categoryinfo.Reason
-                    Type = $err.GetType().ToString()
-                    Exception = ($err.exception -split ': ')[1]
-                    QualifiedError = $err.FullyQualifiedErrorId
-                    CharacterNumber = $err.InvocationInfo.OffsetInLine
-                    LineNumber = $err.InvocationInfo.ScriptLineNumber
-                    Line = $err.InvocationInfo.Line
-                    TargetObject = $err.TargetObject
-                    }
-                }               
-            Default {
-                $hash = @{
-                    Category = $err.errorrecord.categoryinfo.category
-                    Activity = $err.errorrecord.categoryinfo.Activity
-                    Reason = $err.errorrecord.categoryinfo.Reason
-                    Type = $err.GetType().ToString()
-                    Exception = ($err.errorrecord.exception -split ': ')[1]
-                    QualifiedError = $err.errorrecord.FullyQualifiedErrorId
-                    CharacterNumber = $err.errorrecord.InvocationInfo.OffsetInLine
-                    LineNumber = $err.errorrecord.InvocationInfo.ScriptLineNumber
-                    Line = $err.errorrecord.InvocationInfo.Line
-                    TargetObject = $err.errorrecord.TargetObject
-                }
-            }
-        }
-    $object = New-Object PSObject -Property $hash
-    $object.PSTypeNames.Insert(0,'ErrorInformation')
-    $object
-    }
-}
+# Note: the old duplicate $GetErrors block was removed here. The rich version
+# defined later (near the View Errors menu wiring) is the one that executes;
+# this earlier copy silently shadowed it and referenced $performanceHash in
+# the wrong scope.
 
 #Install downloaded updates
 $InstallUpdates = {
@@ -3674,8 +3649,8 @@ $InstallUpdates = {
             $uiHash.Listview.Items.Refresh()
         })
 
-        #Check if any updates require reboot
-        $rebootRequired = (.\PsExec.exe -accepteula -nobanner -s "\\$($Computer.computer)" cmd.exe /c 'echo . | powershell.exe -ExecutionPolicy Bypass -Command "&{return (New-Object -ComObject "Microsoft.Update.SystemInfo").RebootRequired}"') -eq $true
+        #Check if any updates require reboot (uses the centralized PsExec path for runspace reliability)
+        $rebootRequired = (& $ConfigPaths.PsExec -accepteula -nobanner -s "\\$($Computer.computer)" cmd.exe /c 'echo . | powershell.exe -ExecutionPolicy Bypass -Command "&{return (New-Object -ComObject "Microsoft.Update.SystemInfo").RebootRequired}"') -eq $true
         if($LASTEXITCODE -ne 0){
             throw "PsExec failed with error code $LASTEXITCODE"
         }
@@ -3804,17 +3779,34 @@ $RestartComputer = {
         })
 
         $onlineWait = 0
-        While($true){ #Wait for computer to come online
-            try{
-                [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session',$Computer.computer))
-                Break
-            }
-            catch{
-                Start-Sleep 5
-                $onlineWait += 5
-                if($onlineWait -ge 1800){
-                    throw "Computer $($Computer.computer) did not come back online within 30 minutes of restarting."
+        While($true){ #Wait for computer to come online (each COM probe is bounded by a 10s job)
+            $probeJob = $null
+            $probeOk = $false
+            try {
+                $probeJob = Start-Job -ScriptBlock {
+                    param($ComputerName)
+                    try {
+                        [void][activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session',$ComputerName))
+                        return $true
+                    } catch {
+                        return $false
+                    }
+                } -ArgumentList $Computer.computer
+                if ((Wait-Job -Job $probeJob -Timeout 10) -and (Receive-Job -Job $probeJob)) {
+                    $probeOk = $true
                 }
+            } catch {
+                # Job infrastructure failure - treat as not yet online
+            } finally {
+                if ($probeJob) { Remove-Job -Job $probeJob -Force -ErrorAction SilentlyContinue }
+            }
+            
+            if ($probeOk) { Break }
+            
+            Start-Sleep 5
+            $onlineWait += 5
+            if($onlineWait -ge 1800){
+                throw "Computer $($Computer.computer) did not come back online within 30 minutes of restarting."
             }
         }
     }
@@ -3836,135 +3828,11 @@ $RestartComputer = {
     }
 }
 
-#Start, stop, or restart Windows Update Service
-$WUServiceAction = {
-    Param($Computer,$Action)
-    try{
-        #Start Windows Update Service
-        if($Action -eq 'Start'){
-            #Update status
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Starting Windows Update Service'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
-
-            #Start service
-            if ($computer.computer -eq 'localhost' -or $computer.computer -eq $env:COMPUTERNAME) {
-                Get-Service -Name wuauserv -ErrorAction Stop | Start-Service -ErrorAction Stop
-            } else {
-                # Get appropriate credentials for this computer
-                $credential = Get-RemoteCredentials -ComputerName $computer.computer -Operation 'Windows Update service start'
-                
-                if ($credential) {
-                    Invoke-Command -ComputerName $computer.computer -Credential $credential -ScriptBlock {
-                        Get-Service -Name wuauserv -ErrorAction Stop | Start-Service -ErrorAction Stop
-                    } -ErrorAction Stop
-                } else {
-                    Invoke-Command -ComputerName $computer.computer -ScriptBlock {
-                        Get-Service -Name wuauserv -ErrorAction Stop | Start-Service -ErrorAction Stop
-                    } -ErrorAction Stop
-                }
-            }
-
-            #Update status
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Windows Update Service Started'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
-        }
-    
-        #Stop Windows Update Service
-        ElseIf($Action -eq 'Stop'){
-            #Update status
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Stopping Windows Update Service'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
-
-            #Stop service
-            if ($computer.computer -eq 'localhost' -or $computer.computer -eq $env:COMPUTERNAME) {
-                Get-Service -Name wuauserv -ErrorAction Stop | Stop-Service -ErrorAction Stop
-            } else {
-                # Get appropriate credentials for this computer
-                $credential = Get-RemoteCredentials -ComputerName $computer.computer -Operation 'Windows Update service stop'
-                
-                if ($credential) {
-                    Invoke-Command -ComputerName $computer.computer -Credential $credential -ScriptBlock {
-                        Get-Service -Name wuauserv -ErrorAction Stop | Stop-Service -ErrorAction Stop
-                    } -ErrorAction Stop
-                } else {
-                    Invoke-Command -ComputerName $computer.computer -ScriptBlock {
-                        Get-Service -Name wuauserv -ErrorAction Stop | Stop-Service -ErrorAction Stop
-                    } -ErrorAction Stop
-                }
-            }
-
-            #Update status
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Windows Update Service Stopped'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
-        }
-
-        #Restart Windows Update Service
-        ElseIf($Action -eq 'Restart'){
-            #Update status
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Restarting Windows Update Service'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
-
-            #Restart service
-            if ($computer.computer -eq 'localhost' -or $computer.computer -eq $env:COMPUTERNAME) {
-                Get-Service -Name wuauserv -ErrorAction Stop | Restart-Service -ErrorAction Stop
-            } else {
-                Invoke-Command -ComputerName $computer.computer -ScriptBlock {
-                    Get-Service -Name wuauserv -ErrorAction Stop | Restart-Service -ErrorAction Stop
-                } -ErrorAction Stop
-            }
-
-            #Update status
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Windows Update Service Restarted'
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
-        }
-
-        #Invalid action
-        Else{
-            & $WriteDebugLogScript -Message "Invalid action specified: $Action" -Level 'ERROR' -Computer $Computer.Computer
-            throw "Invalid action specified: $Action"
-        }
-    }
-    Catch{
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Error occured: $($_.Exception.Message)"
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
-            }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
-
-        #Cancel any remaining actions
-        exit
-    }
-}
+# Note: the old duplicate $WUServiceAction block was removed here. The live
+# definition near the event wiring (below) is the one invoked by the service
+# menus. This earlier copy still called Get-RemoteCredentials and bare `exit`
+# (never reachable in the isolated runspace, but a maintenance hazard since
+# PowerShell silently allowed the duplicate to shadow the working version).
 
 #endregion Error Handling
 
@@ -5508,16 +5376,23 @@ $eventWUServiceAction = {
 }
 
 # Windows Update Service Action ScriptBlock
+# NOTE: runs in the isolated per-computer runspace - use only injected scripts
+# ($WriteDebugLogScript) or inline code, never main-script functions.
 $WUServiceAction = {
     Param ($Computer, $Action)
     
     Try {
-        Write-InfoLog "Performing Windows Update service action '$Action' on $($Computer.Computer)"
+        try { & $WriteDebugLogScript -Message "Performing Windows Update service action '$Action' on $($Computer.Computer)" -Level 'INFO' -Computer $Computer.Computer } catch { }
         
         # Update status
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "${Action}ing Windows Update Service..."
+            $computer.Status = switch ($Action) {
+                'Start'   { 'Starting Windows Update Service...' }
+                'Stop'    { 'Stopping Windows Update Service...' }
+                'Restart' { 'Restarting Windows Update Service...' }
+                default   { "${Action}ing Windows Update Service..." }
+            }
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
@@ -5575,10 +5450,10 @@ $WUServiceAction = {
             $uiHash.Listview.Items.Refresh()
         })
         
-        Write-SuccessLog "Windows Update service action '$Action' completed successfully on $($Computer.Computer)"
+        try { & $WriteDebugLogScript -Message "Windows Update service action '$Action' completed successfully on $($Computer.Computer)" -Level 'SUCCESS' -Computer $Computer.Computer } catch { }
         
     } Catch {
-        Write-ErrorLog "Windows Update service action '$Action' failed on $($Computer.Computer): $($_.Exception.Message)"
+        try { & $WriteDebugLogScript -Message "Windows Update service action '$Action' failed on $($Computer.Computer): $($_.Exception.Message)" -Level 'ERROR' -Computer $Computer.Computer } catch { }
         
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
