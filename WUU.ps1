@@ -2896,13 +2896,14 @@ $GetUpdates = {
                     Status = "Testing WMI connectivity (attempt $retryCount/$maxRetries)..."
                 }
                 
-                # Test WMI/CIM connectivity with enhanced credential handling
+                # Test WMI/CIM connectivity with timeout protection
                 if ($EnableDebugLogging) {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                    $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Starting WMI connectivity test"
+                    $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Starting WMI connectivity test with timeout"
                     Add-Content -Path $LogPath -Value $logEntry -Force
                 }
                 
+                $wmiTest = $null
                 if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
@@ -2911,106 +2912,46 @@ $GetUpdates = {
                     }
                     $wmiTest = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
                 } else {
-                    # Get appropriate credentials for this computer
+                    # Use background job with timeout for WMI test (skip Get-RemoteCredentials to prevent hangs)
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                        $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Getting remote credentials for WMI test"
+                        $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Testing WMI via background job (5s timeout)"
                         Add-Content -Path $LogPath -Value $logEntry -Force
                     }
                     
                     try {
-                        $credential = Get-RemoteCredentials -ComputerName $Computer.computer -Operation 'WMI connectivity test'
+                        $wmiJob = Start-Job -ScriptBlock {
+                            param($ComputerName)
+                            try {
+                                $result = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -ErrorAction Stop
+                                return @{ Success = $true; Result = $result }
+                            } catch {
+                                return @{ Success = $false; Error = $_.Exception.Message }
+                            }
+                        } -ArgumentList $Computer.computer
                         
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $credentialStatus = if ($credential) { "Credentials obtained" } else { "Using default credentials" }
-                            $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] $credentialStatus"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
+                        $jobCompleted = Wait-Job -Job $wmiJob -Timeout 5
+                        if ($jobCompleted) {
+                            $wmiResult = Receive-Job -Job $wmiJob
+                            Remove-Job -Job $wmiJob -Force -ErrorAction SilentlyContinue
+                            if ($wmiResult.Success) {
+                                $wmiTest = $wmiResult.Result
+                                if ($EnableDebugLogging) {
+                                    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+                                    $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] WMI test successful"
+                                    Add-Content -Path $LogPath -Value $logEntry -Force
+                                }
+                            } else {
+                                throw "WMI test failed: $($wmiResult.Error)"
+                            }
+                        } else {
+                            throw "WMI test timed out after 5 seconds"
                         }
                     } catch {
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] Failed to get credentials: $($_.Exception.Message)"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
-                        }
-                        throw "Failed to obtain credentials for $($Computer.computer): $($_.Exception.Message)"
+                        throw "WMI connectivity test failed: $($_.Exception.Message)"
                     }
                     
-                    # Quick connectivity test first (2 second timeout, 1 ping)
-                    if ($Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Testing basic connectivity with 2s timeout"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
-                        }
-                        
-                        $pingResult = Test-Connection -ComputerName $Computer.computer -Count 1 -Quiet -TimeoutSeconds 2
-                        if (-not $pingResult) {
-                            $errorMessage = "Host $($Computer.computer) is not reachable (ping timeout after 2s). Check network connectivity, firewall ICMP rules, or verify the computer exists."
-                            SafeUpdateListViewItem $Computer.computer @{
-                                Status = $errorMessage
-                            }
-                            throw $errorMessage
-                        }
-                    }
-                    
-                    if ($credential) {
-                        # Use alternate credentials with timeout
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Creating CIM session with alternate credentials (5s timeout)"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
-                        }
-                        try {
-                            $cimSessionOptions = New-CimSessionOption -Protocol DCOM
-                            $cimJob = Start-Job -ScriptBlock {
-                                param($computer, $options, $cred)
-                                $session = New-CimSession -ComputerName $computer -SessionOption $options -Credential $cred -ErrorAction Stop
-                                $result = Get-CimInstance -CimSession $session -ClassName Win32_ComputerSystem -ErrorAction Stop
-                                Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
-                                return $result
-                            } -ArgumentList $Computer.computer, $cimSessionOptions, $credential -ErrorAction Stop
-                            $wmiTest = Wait-Job $cimJob -Timeout 5
-                            if ($wmiTest) {
-                                $wmiTest = Receive-Job $cimJob
-                            } else {
-                                throw "CIM session creation timed out after 5 seconds"
-                            }
-                            Remove-Job $cimJob -Force -ErrorAction SilentlyContinue
-                        } catch {
-                            Stop-Job $cimJob -ErrorAction SilentlyContinue
-                            Remove-Job $cimJob -ErrorAction SilentlyContinue
-                            throw
-                        }
-                    } else {
-                        # Use domain credentials with timeout
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Creating CIM session with domain credentials (5s timeout)"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
-                        }
-                        try {
-                            $cimSessionOptions = New-CimSessionOption -Protocol DCOM
-                            $cimJob = Start-Job -ScriptBlock {
-                                param($computer, $options)
-                                $session = New-CimSession -ComputerName $computer -SessionOption $options -ErrorAction Stop
-                                $result = Get-CimInstance -CimSession $session -ClassName Win32_ComputerSystem -ErrorAction Stop
-                                Remove-CimSession -CimSession $session -ErrorAction SilentlyContinue
-                                return $result
-                            } -ArgumentList $Computer.computer, $cimSessionOptions -ErrorAction Stop
-                            $wmiTest = Wait-Job $cimJob -Timeout 5
-                            if ($wmiTest) {
-                                $wmiTest = Receive-Job $cimJob
-                            } else {
-                                throw "CIM session creation timed out after 5 seconds"
-                            }
-                            Remove-Job $cimJob -Force -ErrorAction SilentlyContinue
-                        } catch {
-                            Stop-Job $cimJob -ErrorAction SilentlyContinue
-                            Remove-Job $cimJob -ErrorAction SilentlyContinue
-                            throw
-                        }
-                    }
+                    # Skip credential-based WMI tests - already tested with default credentials above
                 }
                 
                 if ($EnableDebugLogging) {
@@ -3033,21 +2974,33 @@ if (-not $wmiTest) {
                 }
                 
                 try {
-                    # Use Invoke-Command for remote service management in PowerShell Core
+                    # Use Invoke-Command with timeout for remote service management (skip Get-RemoteCredentials to prevent hangs)
                     if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                         $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
                     } else {
-                        # Get appropriate credentials for this computer
-                        $credential = Get-RemoteCredentials -ComputerName $Computer.computer -Operation 'Windows Update service check'
+                        # Test Windows Update service with background job timeout (prevents hangs)
+                        $serviceJob = Start-Job -ScriptBlock {
+                            param($ComputerName)
+                            try {
+                                $service = Get-Service -Name "wuauserv" -ComputerName $ComputerName -ErrorAction Stop
+                                return @{ Success = $true; Service = $service }
+                            } catch {
+                                return @{ Success = $false; Error = $_.Exception.Message }
+                            }
+                        } -ArgumentList $Computer.computer
                         
-                        if ($credential) {
-                            $wuService = Invoke-Command -ComputerName $Computer.computer -Credential $credential -ScriptBlock {
-                                Get-Service -Name "wuauserv" -ErrorAction Stop
-                            } -ErrorAction Stop
+                        $jobCompleted = Wait-Job -Job $serviceJob -Timeout 5
+                        if ($jobCompleted) {
+                            $serviceResult = Receive-Job -Job $serviceJob
+                            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
+                            if ($serviceResult.Success) {
+                                $wuService = $serviceResult.Service
+                            } else {
+                                throw "Service check failed: $($serviceResult.Error)"
+                            }
                         } else {
-                            $wuService = Invoke-Command -ComputerName $Computer.computer -ScriptBlock {
-                                Get-Service -Name "wuauserv" -ErrorAction Stop
-                            } -ErrorAction Stop
+                            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
+                            throw "Service check timed out after 5 seconds"
                         }
                     }
                     
@@ -3058,57 +3011,37 @@ if (-not $wmiTest) {
                         
                         Write-Warning "Windows Update service is not running on $($Computer.computer). Attempting to start..."
                         
-                        # Start the service using appropriate method
-                        if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
-                            $wuService | Start-Service -ErrorAction Stop
-                        } else {
-                            # Get appropriate credentials for this computer
-                            $credential = Get-RemoteCredentials -ComputerName $Computer.computer -Operation 'Windows Update service start'
-                            
-                            if ($credential) {
-                                Invoke-Command -ComputerName $Computer.computer -Credential $credential -ScriptBlock {
-                                    Get-Service -Name "wuauserv" | Start-Service -ErrorAction Stop
-                                } -ErrorAction Stop
+                        # Start the service using background job with timeout (prevents hangs)
+                        $startJob = Start-Job -ScriptBlock {
+                            param($ComputerName)
+                            try {
+                                $service = Get-Service -Name "wuauserv" -ComputerName $ComputerName -ErrorAction Stop
+                                $service | Start-Service -ErrorAction Stop
+                                Start-Sleep -Seconds 5
+                                $service = Get-Service -Name "wuauserv" -ComputerName $ComputerName -ErrorAction Stop
+                                return @{ Success = ($service.Status -eq 'Running'); Service = $service }
+                            } catch {
+                                return @{ Success = $false; Error = $_.Exception.Message }
+                            }
+                        } -ArgumentList $Computer.computer
+                        
+                        $jobCompleted = Wait-Job -Job $startJob -Timeout 10
+                        if ($jobCompleted) {
+                            $startResult = Receive-Job -Job $startJob
+                            Remove-Job -Job $startJob -Force -ErrorAction SilentlyContinue
+                            if ($startResult.Success) {
+                                $wuService = $startResult.Service
+                                if ($EnableDebugLogging) {
+                                    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+                                    $logEntry = "[$timestamp] [SUCCESS] [$($Computer.Computer)] Windows Update service started successfully"
+                                    Add-Content -Path $LogPath -Value $logEntry -Force
+                                }
                             } else {
-                                Invoke-Command -ComputerName $Computer.computer -ScriptBlock {
-                                    Get-Service -Name "wuauserv" | Start-Service -ErrorAction Stop
-                                } -ErrorAction Stop
-                            }
-                        }
-                        
-                        if ($EnableDebugLogging) {
-                            $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                            $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Starting Windows Update service on $($Computer.Computer)"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
-                        }
-                        Start-Sleep -Seconds 5  # Give service time to start
-                        
-                        # Verify service started successfully
-                        if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
-                            $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
-                        } else {
-                            # Get appropriate credentials for this computer
-                            $credential = Get-RemoteCredentials -ComputerName $Computer.computer -Operation 'Windows Update service verification'
-                            
-                            if ($credential) {
-                                $wuService = Invoke-Command -ComputerName $Computer.computer -Credential $credential -ScriptBlock {
-                                    Get-Service -Name "wuauserv" -ErrorAction Stop
-                                } -ErrorAction Stop
-                            } else {
-                                $wuService = Invoke-Command -ComputerName $Computer.computer -ScriptBlock {
-                                    Get-Service -Name "wuauserv" -ErrorAction Stop
-                                } -ErrorAction Stop
-                            }
-                        }
-                        
-                        if ($wuService.Status -eq 'Running') {
-                            if ($EnableDebugLogging) {
-                                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                                $logEntry = "[$timestamp] [SUCCESS] [$($Computer.Computer)] Windows Update service started successfully on $($Computer.Computer)"
-                                Add-Content -Path $LogPath -Value $logEntry -Force
+                                throw "Service start failed: $($startResult.Error)"
                             }
                         } else {
-                            throw "Windows Update service failed to start. Status: $($wuService.Status)"
+                            Remove-Job -Job $startJob -Force -ErrorAction SilentlyContinue
+                            throw "Service start timed out after 10 seconds"
                         }
                     }
                 } catch {
