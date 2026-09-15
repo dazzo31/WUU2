@@ -795,6 +795,39 @@ function Invoke-ServiceWithTimeout {
     }
 }
 
+# Helper function: Run a remote COM operation in a background job with a hard timeout (prevents UI hangs)
+function Invoke-RemoteComWithTimeout {
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+        
+        [Parameter(Mandatory=$true)]
+        [scriptblock]$ScriptBlock,
+        
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(1, 300)]
+        [int]$TimeoutSeconds = 30
+    )
+    
+    $comJob = $null
+    try {
+        $comJob = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ComputerName
+        
+        if (Wait-Job -Job $comJob -Timeout $TimeoutSeconds) {
+            $output = Receive-Job -Job $comJob
+            Remove-Job -Job $comJob -Force -ErrorAction SilentlyContinue
+            return @{ Success = $true; Output = $output }
+        } else {
+            Remove-Job -Job $comJob -Force -ErrorAction SilentlyContinue
+            return @{ Success = $false; Error = "Operation timed out after $TimeoutSeconds seconds" }
+        }
+    } catch {
+        if ($comJob) { Remove-Job -Job $comJob -Force -ErrorAction SilentlyContinue }
+        return @{ Success = $false; Error = $_.Exception.Message }
+    }
+}
+
 #endregion Credential Management
 
 #region Dialog Functions
@@ -2287,7 +2320,7 @@ function New-ComputerRunspace {
             }
         }.ToString()))
         
-        # Add Get-RemoteCredentials function to runspace
+        # Add Get-RemoteCredentials function to runspace (with timeout protection to prevent hangs)
         $newRunspace.SessionStateProxy.SetVariable('GetRemoteCredentialsScript', [scriptblock]::Create({
             param(
                 [string]$ComputerName,
@@ -2304,42 +2337,59 @@ function New-ComputerRunspace {
                 return $CredentialCache[$ComputerName]
             }
             
+            # Inline timeout helper: runs a CIM probe in a background job with a hard timeout
+            $testCim = {
+                param($ComputerName, $Cred)
+                try {
+                    $params = @{ ClassName = 'Win32_ComputerSystem'; ComputerName = $ComputerName; ErrorAction = 'Stop' }
+                    if ($Cred) { $params.Credential = $Cred }
+                    $r = Get-CimInstance @params
+                    return @{ Success = $true }
+                } catch {
+                    return @{ Success = $false; Error = $_.Exception.Message }
+                }
+            }
+            
             # Try custom credentials first if configured
             if ($UseCustomCredentials -and $CustomCredentials) {
                 try {
-                    # Test custom credentials with a simple WMI query
-                    $testResult = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -Credential $CustomCredentials -ErrorAction Stop
-                    if ($testResult) {
-                        # Custom credentials work, cache success
-                        if (-not $CredentialCache) { $CredentialCache = @{} }
-                        $CredentialCache[$ComputerName] = $CustomCredentials
-                        return $CustomCredentials
+                    $job = Start-Job -ScriptBlock $testCim -ArgumentList $ComputerName, $CustomCredentials
+                    if (Wait-Job -Job $job -Timeout 5) {
+                        $result = Receive-Job -Job $job
+                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                        if ($result -and $result.Success) {
+                            if (-not $CredentialCache) { $CredentialCache = @{} }
+                            $CredentialCache[$ComputerName] = $CustomCredentials
+                            return $CustomCredentials
+                        }
+                    } else {
+                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
                     }
                 } catch {
                     try {
                         & $WriteDebugLogScript -Message "Custom credentials failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
-                    } catch {
-                        # Silently ignore logging failures in runspace
-                    }
+                    } catch { }
                 }
             }
             
             # Custom credentials failed or not configured, try default credentials
             try {
-                # Test default credentials with a simple WMI query
-                $testResult = Get-CimInstance -ClassName Win32_ComputerSystem -ComputerName $ComputerName -ErrorAction Stop
-                if ($testResult) {
-                    # Default credentials work, cache success
-                    if (-not $CredentialCache) { $CredentialCache = @{} }
-                    $CredentialCache[$ComputerName] = $null  # null means use default credentials
-                    return $null
+                $job = Start-Job -ScriptBlock $testCim -ArgumentList $ComputerName, $null
+                if (Wait-Job -Job $job -Timeout 5) {
+                    $result = Receive-Job -Job $job
+                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                    if ($result -and $result.Success) {
+                        if (-not $CredentialCache) { $CredentialCache = @{} }
+                        $CredentialCache[$ComputerName] = $null  # null means use default credentials
+                        return $null
+                    }
+                } else {
+                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
                 }
             } catch {
                 try {
                     & $WriteDebugLogScript -Message "Default credentials failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
-                } catch {
-                    # Silently ignore logging failures in runspace
-                }
+                } catch { }
             }
             
             # Cannot prompt for credentials from a background runspace (deadlocks UI thread)
@@ -2845,7 +2895,7 @@ $GetUpdates = {
             
             # Check if script block is available
             if (Get-Variable -Name 'GetRemoteCredentialsScript' -ErrorAction SilentlyContinue) {
-                Get-RemoteCredentials -ComputerName $ComputerName -Operation $Operation
+                & $GetRemoteCredentialsScript -ComputerName $ComputerName -Operation $Operation
             } else {
                 # Fallback: for remote computers, return null (use default credentials)
                 # For localhost, this should not be called
@@ -2876,6 +2926,110 @@ $GetUpdates = {
         function Invoke-AutoRecovery {
             param([string]$ComputerName, [string]$ErrorCode)
             & $InvokeAutoRecoveryScript -ComputerName $ComputerName -ErrorCode $ErrorCode
+        }
+        
+        # Define timeout helpers locally (isolated runspace does not inherit script-scope functions)
+        function Invoke-CimWithTimeout {
+            param(
+                [string]$ComputerName,
+                [string]$ClassName = 'Win32_ComputerSystem',
+                [int]$TimeoutSeconds = 5,
+                $Credential = $null,
+                [string]$Operation = 'CIM operation'
+            )
+            $cimJob = $null
+            try {
+                $cimJob = Start-Job -ScriptBlock {
+                    param($ComputerName, $ClassName, $Cred)
+                    try {
+                        $params = @{ ClassName = $ClassName; ComputerName = $ComputerName; ErrorAction = 'Stop' }
+                        if ($Cred) { $params.Credential = $Cred }
+                        $result = Get-CimInstance @params
+                        return @{ Success = $true; Result = $result }
+                    } catch {
+                        return @{ Success = $false; Error = $_.Exception.Message }
+                    }
+                } -ArgumentList $ComputerName, $ClassName, $Credential
+                $jobCompleted = Wait-Job -Job $cimJob -Timeout $TimeoutSeconds
+                if ($jobCompleted) {
+                    $cimResult = Receive-Job -Job $cimJob
+                    if ($cimResult -and $cimResult.Success) {
+                        return @{ Success = $true; Result = $cimResult.Result }
+                    } else {
+                        $errorMsg = if ($cimResult -and $cimResult.Error) { $cimResult.Error } else { 'Unknown error' }
+                        return @{ Success = $false; Error = $errorMsg }
+                    }
+                } else {
+                    return @{ Success = $false; Error = "$Operation timed out after $TimeoutSeconds seconds" }
+                }
+            } catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            } finally {
+                if ($cimJob) { Remove-Job -Job $cimJob -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        
+        function Invoke-ServiceWithTimeout {
+            param(
+                [string]$ComputerName,
+                [string]$ServiceName = 'wuauserv',
+                [ValidateSet('Check', 'Start', 'Stop', 'Restart')]
+                [string]$Action = 'Check',
+                [int]$TimeoutSeconds = 5,
+                [int]$PostActionDelay = 5
+            )
+            $serviceJob = $null
+            try {
+                $serviceJob = Start-Job -ScriptBlock {
+                    param($ComputerName, $ServiceName, $Action, $Delay)
+                    try {
+                        $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                        switch ($Action) {
+                            'Start' {
+                                $service | Start-Service -ErrorAction Stop
+                                Start-Sleep -Seconds $Delay
+                                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                                $success = ($service.Status -eq 'Running')
+                            }
+                            'Stop' {
+                                $service | Stop-Service -ErrorAction Stop
+                                Start-Sleep -Seconds $Delay
+                                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                                $success = ($service.Status -eq 'Stopped')
+                            }
+                            'Restart' {
+                                $service | Restart-Service -ErrorAction Stop
+                                Start-Sleep -Seconds $Delay
+                                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                                $success = ($service.Status -eq 'Running')
+                            }
+                            default { $success = $true }
+                        }
+                        if ($service) {
+                            return @{ Success = $success; Service = $service; Status = $service.Status }
+                        } else {
+                            return @{ Success = $false; Error = 'Service not found or inaccessible' }
+                        }
+                    } catch {
+                        return @{ Success = $false; Error = $_.Exception.Message }
+                    }
+                } -ArgumentList $ComputerName, $ServiceName, $Action, $PostActionDelay
+                $jobCompleted = Wait-Job -Job $serviceJob -Timeout $TimeoutSeconds
+                if ($jobCompleted) {
+                    $serviceResult = Receive-Job -Job $serviceJob
+                    if ($serviceResult) {
+                        return $serviceResult
+                    } else {
+                        return @{ Success = $false; Error = 'No result returned from job' }
+                    }
+                } else {
+                    return @{ Success = $false; Error = "Service $Action timed out after $TimeoutSeconds seconds" }
+                }
+            } catch {
+                return @{ Success = $false; Error = $_.Exception.Message }
+            } finally {
+                if ($serviceJob) { Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue }
+            }
         }
         
         # Phase gating is handled on the UI thread by Start-PendingUpdateCheck before this job starts.
@@ -3020,10 +3174,7 @@ $GetUpdates = {
                 }
                 
                 $wmiTest = $null
-                $wmiSuccess = $false
-                
-                try {
-                    if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
+                if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Using localhost WMI connection"
@@ -3040,29 +3191,21 @@ $GetUpdates = {
                     
                     $wmiResult = Invoke-CimWithTimeout -ComputerName $Computer.computer -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Operation 'WMI connectivity test'
                     
-                        if ($wmiResult -and $wmiResult.Success) {
-                            $wmiTest = $wmiResult.Result
-                            $wmiSuccess = $true
-                            if ($EnableDebugLogging) {
-                                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                                $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] WMI test successful"
-                                Add-Content -Path $LogPath -Value $logEntry -Force
-                            }
-                        } else {
-                            $errorMsg = if ($wmiResult -and $wmiResult.Error) { $wmiResult.Error } else { 'Unknown error' }
-                            throw "WMI connectivity test failed: $errorMsg"
-                        }
-                        
-                        # Skip credential-based WMI tests - already tested with default credentials above
+                    if ($wmiResult -and $wmiResult.Success) {
+                        $wmiTest = $wmiResult.Result
+                    } else {
+                        $errorMsg = if ($wmiResult -and $wmiResult.Error) { $wmiResult.Error } else { 'Unknown error' }
+                        throw "WMI connectivity test failed: $errorMsg"
                     }
-                } catch {
-                    $wmiSuccess = $false
-                    throw $_
                 }
-        Status = $errorMessage
-    }
-    throw $errorMessage
-}
+                
+                if (-not $wmiTest) {
+                    $errorMessage = "WMI is not accessible on $($Computer.computer). This could indicate network connectivity issues, firewall blocking, or WMI service problems. Suggestions: verify WMI service is running, check firewall WMI exceptions, ensure proper credentials."
+                    SafeUpdateListViewItem $Computer.computer @{
+                        Status = $errorMessage
+                    }
+                    throw $errorMessage
+                }
                 
                 # Test RPC connectivity by checking Windows Update service
                 SafeUpdateListViewItem $Computer.computer @{
@@ -5207,79 +5350,131 @@ $eventShowAvailableUpdates = {
 }
 $eventShowInstalledUpdates = {
     ForEach ($Computer in $uiHash.Listview.SelectedItems){
-        $updatesession =  [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session',$Computer.computer))
-        $updatesearcher = $updatesession.CreateUpdateSearcher()
-        $updatesearcher.Search('IsInstalled=1').Updates | Select-Object Title,Description,IsUninstallable,SupportUrl | Out-GridView -Title "$($Computer.computer)'s Installed Updates"
+        $comResult = Invoke-RemoteComWithTimeout -ComputerName $Computer.computer -TimeoutSeconds 30 -ScriptBlock {
+            param($ComputerName)
+            try {
+                $session = [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session', $ComputerName))
+                $searcher = $session.CreateUpdateSearcher()
+                $updates = @($searcher.Search('IsInstalled=1').Updates)
+                $result = $updates | ForEach-Object {
+                    [PSCustomObject]@{
+                        Title = $_.Title
+                        Description = $_.Description
+                        IsUninstallable = $_.IsUninstallable
+                        SupportUrl = $_.SupportUrl
+                    }
+                }
+                return $result
+            } catch {
+                return @([PSCustomObject]@{ Error = $_.Exception.Message })
+            }
+        }
+        if ($comResult.Success) {
+            $comResult.Output | Out-GridView -Title "$($Computer.computer)'s Installed Updates"
+        } else {
+            Update-Status "Failed to show installed updates for $($Computer.computer): $($comResult.Error)"
+        }
     }
 }
 $eventAuditWSUSUpdates = {
     # Audit WSUS-approved updates and compare with Windows Update count
     ForEach ($Computer in $uiHash.Listview.SelectedItems){
-        try {
-            $updatesession = [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session',$Computer.computer))
-            $updatesearcher = $updatesession.CreateUpdateSearcher()
-            
-            # Search 1: Standard search (what WUU uses)
-            $standardResults = $updatesearcher.Search('IsInstalled=0 and IsHidden=0')
-            
-            # Search 2: Include hidden updates
-            $allResults = $updatesearcher.Search('IsInstalled=0')
-            
-            # Search 3: WSUS-assigned updates
-            $wsusResults = $updatesearcher.Search('IsInstalled=0 and IsAssigned=1')
-            
-            # Check WSUS configuration
-            $wsusServer = $null
+        $comResult = Invoke-RemoteComWithTimeout -ComputerName $Computer.computer -TimeoutSeconds 60 -ScriptBlock {
+            param($ComputerName)
             try {
-                $wsusKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
-                if (Test-Path $wsusKey) {
-                    $wsusServer = (Get-ItemProperty -Path $wsusKey -Name "WUServer" -ErrorAction SilentlyContinue).WUServer
+                $session = [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session', $ComputerName))
+                $searcher = $session.CreateUpdateSearcher()
+                
+                $standardResults = $searcher.Search('IsInstalled=0 and IsHidden=0')
+                $allResults = $searcher.Search('IsInstalled=0')
+                $wsusResults = $searcher.Search('IsInstalled=0 and IsAssigned=1')
+                
+                $wsusServer = $null
+                try {
+                    $wsusKey = "HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsUpdate"
+                    if (Test-Path $wsusKey) {
+                        $wsusServer = (Get-ItemProperty -Path $wsusKey -Name "WUServer" -ErrorAction SilentlyContinue).WUServer
+                    }
+                } catch {
+                    $wsusServer = "Unable to detect"
+                }
+                
+                $rebootRequired = $false
+                try {
+                    $rebootRequired = (New-Object -ComObject 'Microsoft.Update.SystemInfo').RebootRequired
+                } catch { }
+                
+                return [PSCustomObject]@{
+                    Computer = $ComputerName
+                    WSUS_Server = $wsusServer
+                    Standard_Search_Count = $standardResults.Updates.Count
+                    Including_Hidden_Count = $allResults.Updates.Count
+                    WSUS_Assigned_Count = $wsusResults.Updates.Count
+                    Downloaded_Count = @($standardResults.Updates | Where-Object {$_.IsDownloaded}).Count
+                    Not_Downloaded_Count = @($standardResults.Updates | Where-Object {-not $_.IsDownloaded}).Count
+                    Reboot_Required = $rebootRequired
+                    Updates = @($standardResults.Updates | ForEach-Object {
+                        [PSCustomObject]@{
+                            Title = $_.Title
+                            Downloaded = $_.IsDownloaded
+                            Mandatory = $_.IsMandatory
+                            Assigned = $_.IsAssigned
+                        }
+                    })
                 }
             } catch {
-                $wsusServer = "Unable to detect"
+                return [PSCustomObject]@{ Error = $_.Exception.Message }
             }
-            
-            # Check reboot status
-            $rebootRequired = (New-Object -ComObject 'Microsoft.Update.SystemInfo').RebootRequired
-            
-            # Display results
-            $auditResults = [PSCustomObject]@{
-                Computer = $Computer.computer
-                WSUS_Server = $wsusServer
-                Standard_Search_Count = $standardResults.Updates.Count
-                Including_Hidden_Count = $allResults.Updates.Count
-                WSUS_Assigned_Count = $wsusResults.Updates.Count
-                Downloaded_Count = @($standardResults.Updates | Where-Object {$_.IsDownloaded}).Count
-                Not_Downloaded_Count = @($standardResults.Updates | Where-Object {-not $_.IsDownloaded}).Count
-                Reboot_Required = $rebootRequired
-            }
-            
-            $auditResults | Format-List | Out-String | Write-Host -ForegroundColor Cyan
-            
-            # Show detailed update list
-            if ($standardResults.Updates.Count -gt 0) {
-                $standardResults.Updates | Select-Object Title, @{n='Downloaded';e={$_.IsDownloaded}}, @{n='Mandatory';e={$_.IsMandatory}}, @{n='Assigned';e={$_.IsAssigned}} | Out-GridView -Title "WSUS Audit: $($Computer.computer) - $($standardResults.Updates.Count) updates found"
+        }
+        
+        if ($comResult.Success) {
+            $audit = $comResult.Output
+            if ($audit.Error) {
+                [PSCustomObject]@{Error = "WSUS audit failed: $($audit.Error)"} | Format-List | Write-Host -ForegroundColor Red
             } else {
-                [PSCustomObject]@{Title="No updates found"} | Out-GridView -Title "WSUS Audit: $($Computer.computer)"
+                $audit | Select-Object Computer, WSUS_Server, Standard_Search_Count, Including_Hidden_Count, WSUS_Assigned_Count, Downloaded_Count, Not_Downloaded_Count, Reboot_Required | Format-List | Out-String | Write-Host -ForegroundColor Cyan
+                
+                if ($audit.Updates.Count -gt 0) {
+                    $audit.Updates | Out-GridView -Title "WSUS Audit: $($Computer.computer) - $($audit.Updates.Count) updates found"
+                } else {
+                    [PSCustomObject]@{Title="No updates found"} | Out-GridView -Title "WSUS Audit: $($Computer.computer)"
+                }
             }
-            
-        } catch {
-            [PSCustomObject]@{Error = "WSUS audit failed: $($_.Exception.Message)"} | Format-List | Write-Host -ForegroundColor Red
+        } else {
+            [PSCustomObject]@{Error = "WSUS audit timed out: $($comResult.Error)"} | Format-List | Write-Host -ForegroundColor Red
         }
     }
 }
 $eventShowUpdateHistory = {
     Try{
         $computer = $uiHash.Listview.SelectedItems | Select-Object -First 1
-# Get installed hotfix, create popup
-        $updatesession =  [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session',$computer.computer))
-        $updatesearcher = $updatesession.CreateUpdateSearcher()
-        $updates = $updateSearcher.QueryHistory(1,$updateSearcher.GetTotalHistoryCount())
-        $updates | Select-Object -Property `
-        @{name="Operation"; expression={switch($_.Operation){1 {"Installation"}; 2 {"Uninstallation"}; 3 {"Other"}}}},`
-        @{name="Result"; expression={switch($_.ResultCode){1 {"Success"}; 2 {"Success (reboot required)"}; 4 {"Failure"}}}},`
-        @{n='HResult';e={'0x' + [Convert]::ToString($_.HResult, 16)}},`
-        Date,Title,Description,SupportUrl | Out-GridView -Title "$($computer.computer)'s Update History"
+        $comResult = Invoke-RemoteComWithTimeout -ComputerName $computer.computer -TimeoutSeconds 30 -ScriptBlock {
+            param($ComputerName)
+            try {
+                $session = [activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session', $ComputerName))
+                $searcher = $session.CreateUpdateSearcher()
+                $history = @($searcher.QueryHistory(0, $searcher.GetTotalHistoryCount()))
+                return $history | ForEach-Object {
+                    [PSCustomObject]@{
+                        Operation = switch($_.Operation){1 {"Installation"}; 2 {"Uninstallation"}; 3 {"Other"}; default {$_.Operation}}
+                        Result = switch($_.ResultCode){1 {"Success"}; 2 {"Success (reboot required)"}; 4 {"Failure"}; default {$_.ResultCode}}
+                        HResult = '0x' + [Convert]::ToString($_.HResult, 16)
+                        Date = $_.Date
+                        Title = $_.Title
+                        Description = $_.Description
+                        SupportUrl = $_.SupportUrl
+                    }
+                }
+            } catch {
+                return @([PSCustomObject]@{ Error = $_.Exception.Message })
+            }
+        }
+        
+        if ($comResult.Success) {
+            $comResult.Output | Out-GridView -Title "$($computer.computer)'s Update History"
+        } else {
+            throw "Failed to retrieve update history: $($comResult.Error)"
+        }
     } Catch{
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($computer)
@@ -5327,49 +5522,48 @@ $WUServiceAction = {
             $uiHash.Listview.Items.Refresh()
         })
         
-        # Get credentials for this computer
-        $credential = Get-RemoteCredentials -ComputerName $Computer.Computer -Operation "Windows Update Service $Action"
-        
-        # Perform the service action
-        $scriptBlock = {
-            param($Action)
-            $service = Get-Service -Name 'wuauserv' -ErrorAction Stop
-            
-            switch ($Action) {
-                'Start' { 
-                    if ($service.Status -ne 'Running') {
-                        $service | Start-Service -ErrorAction Stop
-                        return "Windows Update Service started successfully"
-                    } else {
-                        return "Windows Update Service is already running"
-                    }
-                }
-                'Stop' { 
-                    if ($service.Status -ne 'Stopped') {
-                        $service | Stop-Service -Force -ErrorAction Stop
-                        return "Windows Update Service stopped successfully"
-                    } else {
-                        return "Windows Update Service is already stopped"
-                    }
-                }
-                'Restart' { 
-                    $service | Restart-Service -Force -ErrorAction Stop
-                    return "Windows Update Service restarted successfully"
-                }
-                default { 
-                    throw "Unknown action: $Action"
-                }
-            }
-        }
-        
-        # Execute the script block
+        # Perform the service action with timeout protection (avoids hangs)
         if ($Computer.Computer -eq 'localhost' -or $Computer.Computer -eq $env:COMPUTERNAME) {
-            $result = & $scriptBlock $Action
+            $service = Get-Service -Name 'wuauserv' -ErrorAction Stop
+            switch ($Action) {
+                'Start'   { if ($service.Status -ne 'Running') { $service | Start-Service -ErrorAction Stop } }
+                'Stop'    { if ($service.Status -ne 'Stopped') { $service | Stop-Service -Force -ErrorAction Stop } }
+                'Restart' { $service | Restart-Service -Force -ErrorAction Stop }
+                default   { throw "Unknown action: $Action" }
+            }
+            $result = "Windows Update Service ${Action}ed successfully"
         } else {
-            if ($credential) {
-                $result = Invoke-Command -ComputerName $Computer.Computer -ScriptBlock $scriptBlock -ArgumentList $Action -Credential $credential -ErrorAction Stop
+            # Remote: run in a background job with a hard timeout to prevent hangs
+            $serviceJob = Start-Job -ScriptBlock {
+                param($ComputerName, $Action)
+                try {
+                    Invoke-Command -ComputerName $ComputerName -ScriptBlock {
+                        param($a)
+                        $s = Get-Service -Name 'wuauserv' -ErrorAction Stop
+                        switch ($a) {
+                            'Start'   { if ($s.Status -ne 'Running') { $s | Start-Service -ErrorAction Stop } }
+                            'Stop'    { if ($s.Status -ne 'Stopped') { $s | Stop-Service -Force -ErrorAction Stop } }
+                            'Restart' { $s | Restart-Service -Force -ErrorAction Stop }
+                        }
+                    } -ArgumentList $Action -ErrorAction Stop
+                    return @{ Success = $true; Message = "Windows Update Service ${Action}ed successfully" }
+                } catch {
+                    return @{ Success = $false; Error = $_.Exception.Message }
+                }
+            } -ArgumentList $Computer.Computer, $Action
+            
+            if (Wait-Job -Job $serviceJob -Timeout 20) {
+                $jobResult = Receive-Job -Job $serviceJob
+                Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
+                if ($jobResult -and $jobResult.Success) {
+                    $result = $jobResult.Message
+                } else {
+                    $errorMsg = if ($jobResult -and $jobResult.Error) { $jobResult.Error } else { 'Service action failed with unknown error' }
+                    throw $errorMsg
+                }
             } else {
-                $result = Invoke-Command -ComputerName $Computer.Computer -ScriptBlock $scriptBlock -ArgumentList $Action -ErrorAction Stop
+                Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
+                throw "Service $Action timed out after 20 seconds"
             }
         }
         
