@@ -118,6 +118,9 @@
         </Style>
         
         <!-- Header Template for GridView with modern styling -->
+        <!-- NOTE: the resize grip (PART_HeaderGrip) lives in GridViewColumnHeaderStyle's
+             ControlTemplate, NOT here - GridViewColumnHeader only hooks a Thumb named
+             PART_HeaderGrip inside its own template. -->
         <DataTemplate x:Key="HeaderTemplate">
             <Grid Background="{StaticResource SecondaryBackground}">
                 <TextBlock FontSize="12" Foreground="{StaticResource TextPrimary}" FontWeight="SemiBold" Margin="8,6" Text="{Binding}"/>
@@ -138,12 +141,29 @@
             <Setter Property="Template">
                 <Setter.Value>
                     <ControlTemplate TargetType="GridViewColumnHeader">
-                        <Border Background="{TemplateBinding Background}" 
-                                BorderBrush="{TemplateBinding BorderBrush}"
-                                BorderThickness="{TemplateBinding BorderThickness}">
-                            <ContentPresenter Margin="{TemplateBinding Padding}" 
-                                            HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
-                        </Border>
+                        <Grid>
+                            <Border Background="{TemplateBinding Background}" 
+                                    BorderBrush="{TemplateBinding BorderBrush}"
+                                    BorderThickness="{TemplateBinding BorderThickness}">
+                                <ContentPresenter Margin="{TemplateBinding Padding}" 
+                                                HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"/>
+                            </Border>
+                            <!-- The Thumb MUST be named PART_HeaderGripper (with 'er') -
+                                 WPF's GridViewColumnHeader.HookupGripperEvents looks up
+                                 exactly this name to wire its native drag-resize handlers.
+                                 (Commonly-documented 'PART_HeaderGrip' is WRONG.) -->
+                            <Thumb x:Name="PART_HeaderGripper" 
+                                   HorizontalAlignment="Right" 
+                                   VerticalAlignment="Stretch" 
+                                   Width="4" 
+                                   Cursor="SizeWE" 
+                                   Background="Transparent"/>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="Role" Value="Floating">
+                                <Setter TargetName="PART_HeaderGripper" Property="Visibility" Value="Collapsed"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
             </Setter>

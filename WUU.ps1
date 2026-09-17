@@ -58,7 +58,7 @@ Enhanced Version - 2025-07-08
 
 # Toggle debug logging. Set to $true to enable detailed logging (performance impact).
 # WARNING: Enabling this creates large log files and reduces performance.
-$script:EnableDebugLogging = $false
+$script:EnableDebugLogging = $true
 
 # Timeout settings (seconds)
 $sessionTimeout = 30       # Timeout for creating Windows Update session
@@ -2143,6 +2143,11 @@ function New-ComputerRunspace {
         }.ToString()))
         
         # Add safe ListView update function to runspace
+        # CRITICAL: the dispatcher action below executes on the UI thread while the worker
+        # runspace that owns this scriptblock is BLOCKED inside Dispatcher.Invoke waiting for
+        # it. Pipeline cmdlets (Where-Object/Select-Object/Sort-Object...) inside the action
+        # would need that busy worker runspace's engine to run -> guaranteed deadlock.
+        # Only use PowerShell LANGUAGE constructs (foreach/if/property sets) in here.
         $newRunspace.SessionStateProxy.SetVariable('SafeUpdateListViewItemScript', [scriptblock]::Create({
             param(
                 [string]$ComputerName,
@@ -2157,7 +2162,11 @@ function New-ComputerRunspace {
             try {
                 $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                     # Find the actual item in the ListView that corresponds to this computer
-                    $actualItem = $uiHash.Listview.Items | Where-Object { $_.Computer -eq $ComputerName } | Select-Object -First 1
+                    # (foreach loop, NOT a Where-Object pipeline - see comment above)
+                    $actualItem = $null
+                    foreach ($item in $uiHash.Listview.Items) {
+                        if ($item.Computer -eq $ComputerName) { $actualItem = $item; break }
+                    }
                     
                     if ($actualItem) {
                         $uiHash.Listview.Items.EditItem($actualItem)
@@ -2344,7 +2353,6 @@ function New-ComputerRunspace {
                 try {
                     $params = @{ ClassName = 'Win32_ComputerSystem'; ComputerName = $ComputerName; ErrorAction = 'Stop' }
                     if ($Cred) { $params.Credential = $Cred }
-                    $r = Get-CimInstance @params
                     return @{ Success = $true }
                 } catch {
                     return @{ Success = $false; Error = $_.Exception.Message }
@@ -3899,9 +3907,14 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     
 
                     # Update computer status to show timeout (item lookup must happen on the UI thread)
+                    # Note: language constructs only inside the action - pipeline cmdlets (Where-Object)
+                    # would bind to this busy cleanup runspace and deadlock the UI thread.
                     try {
                         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                            $computer = $uiHash.Listview.Items | Where-Object { $_.Computer -eq $timedOutComputer } | Select-Object -First 1
+                            $computer = $null
+                            foreach ($entry in $uiHash.Listview.Items) {
+                                if ($entry.Computer -eq $timedOutComputer) { $computer = $entry; break }
+                            }
                             if ($computer) {
                                 $uiHash.Listview.Items.EditItem($computer)
                                 $computer.Status = "Operation timed out after 10 minutes"
@@ -4045,6 +4058,127 @@ $eventCopyCellContent = {
     }
 }
 
+# Proportionally resize the ListView GridView columns to fill the available width.
+# Called on window resize and when columns are resized by dragging (after the drag ends,
+# remaining columns redistribute leftover space so the header always spans the window).
+# Runs on the UI thread only. Returns nothing.
+function Set-ColumnProportionalWidths {
+    $listview = $uiHash.ListView
+    if (-not $listview -or -not $uiHash.GridView) { return }
+    $columns = $uiHash.GridView.Columns
+    if (-not $columns -or $columns.Count -eq 0) { return }
+
+    # Desired proportion of total width per column, looked up by Header text
+    # (GridViewColumn has no Name property). Sums to 1.0.
+    $proportions = @{
+        'Computer'       = 0.18
+        'Phase'          = 0.08
+        'Available'      = 0.07
+        'Downloaded'     = 0.08
+        'Install Errors' = 0.09
+        'Status'         = 0.28
+        'Reboot Required' = 0.11
+        'Updates Status' = 0.11
+    }
+
+    # Compute available width inside the ListView viewport (excludes the vertical scrollbar).
+    # ListView has BorderThickness=0, so no border compensation is needed.
+    $viewportWidth = $null
+    try {
+        # Walk the visual tree to the ScrollViewer (standard ListView template:
+        # ListView > Border > ScrollViewer > ItemsPresenter).
+        $child = [System.Windows.Media.VisualTreeHelper]::GetChild($listview, 0)
+        $guard = 0
+        while ($child -and $guard -lt 5) {
+            if ($child -is [System.Windows.Controls.ScrollViewer]) {
+                $viewportWidth = $child.ViewportWidth
+                break
+            }
+            if ([System.Windows.Media.VisualTreeHelper]::GetChildrenCount($child) -gt 0) {
+                $child = [System.Windows.Media.VisualTreeHelper]::GetChild($child, 0)
+            } else {
+                $child = $null
+            }
+            $guard++
+        }
+    } catch { $null = $_ }
+    if (-not $viewportWidth -or $viewportWidth -le 0) {
+        # Fallback: use ListView width directly if the visual tree is not ready yet.
+        $viewportWidth = $listview.ActualWidth
+    }
+    if (-not $viewportWidth -or $viewportWidth -le 100) { return }
+
+    # Water-filling distribution: columns whose proportional share falls below the
+    # minimum are pinned to it and the remaining columns re-split the leftover space,
+    # so the header spans the viewport exactly whenever it can. Columns the user has
+    # dragged keep their explicit width; the others absorb size changes. When even the
+    # minimums don't fit, the total exceeds the viewport and the ListView's horizontal
+    # scrollbar takes over (scrolling + manual resize still work - by design).
+    $minWidth = 40.0
+
+    $fixedTotal = 0.0
+    $freeColumns = @()   # columns to size proportionally
+    foreach ($column in $columns) {
+        if ($script:userResizedColumns -and $script:userResizedColumns.ContainsKey($column.Header)) {
+            $fixedTotal += [double]$column.Width
+        } else {
+            $proportion = $proportions[$column.Header]
+            if (-not $proportion) { $proportion = [double]1.0 / $columns.Count }
+            $freeColumns += [pscustomobject]@{ Column = $column; Proportion = $proportion }
+        }
+    }
+    if ($freeColumns.Count -eq 0) { return }   # every column user-sized: leave as-is
+
+    $remaining = $viewportWidth - $fixedTotal
+
+    # Pin shares that fall below minWidth, re-splitting the rest until stable.
+    $pinned = @()
+    $pending = @($freeColumns)
+    $stable = $false
+    while (-not $stable -and $pending.Count -gt 0) {
+        $stable = $true
+        $proportionTotal = 0.0
+        foreach ($entry in $pending) { $proportionTotal += $entry.Proportion }
+        $next = @()
+        foreach ($entry in $pending) {
+            $share = 0.0
+            if ($proportionTotal -gt 0) { $share = $remaining * ($entry.Proportion / $proportionTotal) }
+            if ($share -lt $minWidth) {
+                $pinned += $entry.Column
+                $remaining -= $minWidth
+                $stable = $false
+            } else {
+                $next += $entry
+            }
+        }
+        $pending = $next
+    }
+
+    # Assign integer widths; leftover pixels go to the last free column so the
+    # header spans the viewport exactly.
+    foreach ($column in $pinned) {
+        $column.Width = [int]$minWidth
+    }
+    if ($pending.Count -gt 0) {
+        $proportionTotal = 0.0
+        foreach ($entry in $pending) { $proportionTotal += $entry.Proportion }
+        $assigned = 0.0
+        foreach ($entry in $pending) {
+            $share = 0.0
+            if ($remaining -gt 0 -and $proportionTotal -gt 0) { $share = $remaining * ($entry.Proportion / $proportionTotal) }
+            $width = [math]::Floor($share)
+            if ($width -lt $minWidth) { $width = [int]$minWidth }
+            $entry.Column.Width = [int]$width
+            $assigned += $width
+        }
+        $leftover = $remaining - $assigned
+        if ($leftover -gt 0) {
+            $lastEntry = $pending[-1]
+            $lastEntry.Column.Width = [int]($lastEntry.Column.Width + $leftover)
+        }
+    }
+}
+
 $eventWindowInit = {
     $Script:SortHash = @{}
     
@@ -4069,11 +4203,114 @@ $eventWindowInit = {
     }
     $uiHash.Listview.AddHandler([System.Windows.Controls.GridViewColumnHeader]::ClickEvent, $ColumnSortHandler)
 
+    # Resizable/auto-fitting columns:
+    # NOTE: GridViewColumn has NO MinWidth property (unlike DataGridColumn) - the
+    # 40px floor during native grip drags is enforced by a DragDelta clamp handler
+    # in $script:hookHeaderGrips, and by the water-fill distribution below.
+    # 1) Window/ListView resize -> redistribute column widths proportionally so the
+    #    header always spans the available width.
+    # The fit must run AFTER layout completes: during the SizeChanged callback the
+    # ScrollViewer's ViewportWidth is still the PREVIOUS size, so calling the fit
+    # directly would compute widths from stale values. Defer to Render priority and
+    # coalesce bursts (interactive window resizing fires SizeChanged continuously).
+    $script:pendingColumnFit = $false
+    $uiHash.Listview.Add_SizeChanged({
+        if ($script:isDraggingColumn) { return }   # don't fight the mouse mid-drag
+        if ($script:pendingColumnFit) { return }
+        $script:pendingColumnFit = $true
+        $uiHash.ListView.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{
+            $script:pendingColumnFit = $false
+            Set-ColumnProportionalWidths
+        })
+    })
+
+    # 2) Hook each column's header resize grip. 'Loaded' is a DIRECT routed event, so
+    #    AddHandler on the ListView never sees header Loaded events; instead hook the
+    #    ListView's own Loaded (fires once, headers already exist in the visual tree)
+    #    and re-walk at idle in case headers are regenerated (column reorder).
+    # NOTE: handlers fire long after this scriptblock's scope ends, so all shared
+    # state must live in $script: scope, and per-grip state is recovered from the
+    # event sender (the Thumb's TemplatedParent is its GridViewColumnHeader).
+    # NOTE: the Thumb part name is PART_HeaderGripper (with 'er') - that exact name is
+    # what WPF's GridViewColumnHeader.HookupGripperEvents looks up to wire NATIVE
+    # drag-resize. Our handlers below only track which column was user-resized.
+    $script:userResizedColumns = @{}
+    $script:isDraggingColumn = $false
+    $script:draggingHeader = $null
+    $script:hookHeaderGrips = {
+        # Wire the drag-resize grip of every GridViewColumnHeader currently in the tree.
+        $stack = New-Object System.Collections.Generic.Stack[System.Windows.DependencyObject]
+        $stack.Push($uiHash.ListView)
+        while ($stack.Count -gt 0) {
+            $el = $stack.Pop()
+            if ($el -is [System.Windows.Controls.GridViewColumnHeader]) {
+                $grip = $el.Template.FindName('PART_HeaderGripper', $el)
+                if ($grip -and $grip.Tag -ne 'wired') {
+                    $grip.Tag = 'wired'
+                    # WPF's native gripper handlers subscribe FIRST (in OnApplyTemplate)
+                    # and set e.Handled=true on every drag event - CLR wrappers
+                    # (Add_DragStarted etc.) never see them. Register with
+                    # handledEventsToo=$true so our bookkeeping runs too.
+                    # Clamp: WPF's native gripper allows dragging a column to width 0;
+                    # GridViewColumn has no MinWidth, so enforce a 40px floor here.
+                    $grip.AddHandler(
+                        [System.Windows.Controls.Primitives.Thumb]::DragDeltaEvent,
+                        [System.Windows.Controls.Primitives.DragDeltaEventHandler]{
+                            param($thumb, $dragArgs)
+                            $header = $thumb.TemplatedParent
+                            if ($header -and $header.Column -and $header.Column.Width -lt 40) {
+                                $header.Column.Width = 40
+                            }
+                        }, $true)
+                    $grip.AddHandler(
+                        [System.Windows.Controls.Primitives.Thumb]::DragStartedEvent,
+                        [System.Windows.Controls.Primitives.DragStartedEventHandler]{
+                            param($thumb, $dragArgs)
+                            $script:isDraggingColumn = $true
+                            $script:draggingHeader = $thumb.TemplatedParent
+                        }, $true)
+                    $grip.AddHandler(
+                        [System.Windows.Controls.Primitives.Thumb]::DragCompletedEvent,
+                        [System.Windows.Controls.Primitives.DragCompletedEventHandler]{
+                            param($thumb, $dragArgs)
+                            $script:isDraggingColumn = $false
+                            $header = $thumb.TemplatedParent
+                            if ($header -and $header.Column) {
+                                # This column now keeps the width the user dragged it to
+                                $script:userResizedColumns[$header.Column.Header] = $true
+                            }
+                            $script:draggingHeader = $null
+                            # Redistribute the remaining columns so the header still spans the width
+                            Set-ColumnProportionalWidths
+                        }, $true)
+                }
+            }
+            $n = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($el)
+            for ($i = 0; $i -lt $n; $i++) {
+                $stack.Push([System.Windows.Media.VisualTreeHelper]::GetChild($el, $i))
+            }
+        }
+    }
+    $uiHash.Listview.Add_Loaded({
+        & $script:hookHeaderGrips
+        # Headers can be regenerated when columns are reordered; re-check at idle.
+        $uiHash.ListView.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
+            & $script:hookHeaderGrips
+        })
+    })
+
     #Create and bind the observable collection to the GridView (if not already initialized)
     if ($null -eq $uiHash.clientObservable) {
         $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
         $uiHash.ListView.ItemsSource = $uiHash.clientObservable
     }
+
+    # Size the columns to the actual window once the layout is measured.
+    # Render priority: guarantees the ScrollViewer's ViewportWidth is current.
+    $uiHash.ListView.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Render, [action]{
+        & $script:hookHeaderGrips
+        Set-ColumnProportionalWidths
+    })
 }
 $eventWindowClose = { #Runs when WUU closes
     #Stop the job scheduler timer

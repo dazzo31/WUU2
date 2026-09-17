@@ -1,0 +1,24 @@
+# Debug logs (generated at runtime with EnableDebugLogging = $true)
+WUU_Debug_*.log
+
+# Packaged release output
+dist/
+
+# Historical snapshot scripts/backups - never modify, never commit
+WUU_backup*.ps1
+WUU_backup*.xaml
+WUU_v1.1.ps1
+WUU_debug.ps1
+WUU_git_version.ps1
+WUU_perplexity.ps1
+WUU_updated_backup*.ps1
+WUU.7z
+
+# Sysinternals binary - download per README, not redistributable in repo
+psexec.exe
+
+# Encrypted computer list (contains machine names + DPAPI-protected credential config)
+ComputerList.config
+
+# Local working files
+*.tmp
