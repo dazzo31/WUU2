@@ -673,18 +673,25 @@ function Invoke-CimWithTimeout {
     
     try {
         $cimJob = Start-Job -ScriptBlock {
-            param($ComputerName, $ClassName, $Cred)
+            # $Cred is always a PSCredential (or $null for default credentials) -
+            # typed so a plain-string password can never be passed as a credential.
+            # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
+            # credentials must go through New-CimSession (DCOM to match the old
+            # Get-WmiObject behavior) and Get-CimInstance -CimSession.
+            param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
+            $cimSession = $null
             try {
-                $params = @{
-                    ClassName = $ClassName
-                    ComputerName = $ComputerName
-                    ErrorAction = 'Stop'
+                if ($Cred) {
+                    $cimSession = New-CimSession -ComputerName $ComputerName -Credential $Cred -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
+                    $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
+                } else {
+                    $result = Get-CimInstance -ComputerName $ComputerName -ClassName $ClassName -ErrorAction Stop
                 }
-                if ($Cred) { $params.Credential = $Cred }
-                $result = Get-CimInstance @params
                 return @{ Success = $true; Result = $result }
             } catch {
                 return @{ Success = $false; Error = $_.Exception.Message }
+            } finally {
+                if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
             }
         } -ArgumentList $ComputerName, $ClassName, $Credential
         
@@ -1220,8 +1227,16 @@ function Show-CredentialConfigDialog {
                 
                 $testCredential = New-Object System.Management.Automation.PSCredential($username, $passwordBox.SecurePassword.Copy())
                 
-                # Test with local computer first
-                $testResult = Get-CimInstance -ClassName Win32_ComputerSystem -Credential $testCredential -ErrorAction Stop
+                # Test with local computer first.
+                # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
+                # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
+                $testSession = $null
+                try {
+                    $testSession = New-CimSession -ComputerName 'localhost' -Credential $testCredential -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
+                    $testResult = Get-CimInstance -CimSession $testSession -ClassName Win32_ComputerSystem -ErrorAction Stop
+                } finally {
+                    if ($testSession) { Remove-CimSession -CimSession $testSession -ErrorAction SilentlyContinue }
+                }
                 
                 if ($testResult) {
                     [System.Windows.MessageBox]::Show("Credentials test successful!`nComputer: $($testResult.Name)", "Test Credentials", 'OK', 'Information')
@@ -1718,10 +1733,10 @@ function Unprotect-ComputerListData {
         # Decrypt the data
         $secureData = $EncryptedData | ConvertTo-SecureString -Key $key
         
-        # Convert back to plain text
-        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto(
-            [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureData)
-        )
+        # Convert back to plain text (free the BSTR holding the decrypted plaintext)
+        $dataBSTR = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureData)
+        $plainText = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($dataBSTR)
+        [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($dataBSTR)
         
         # Clean up
         [System.Runtime.InteropServices.Marshal]::ZeroFreeBSTR($passwordBSTR)
@@ -2348,14 +2363,26 @@ function New-ComputerRunspace {
             }
             
             # Inline timeout helper: runs a CIM probe in a background job with a hard timeout
+            # $Cred is always a PSCredential (or $null for default credentials) - typed so a
+            # plain-string password can never be passed as a credential.
+            # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
+            # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
+            # The probe must actually RUN the query - it validates credentials AND reachability.
             $testCim = {
-                param($ComputerName, $Cred)
+                param([string]$ComputerName, [pscredential]$Cred)
+                $cimSession = $null
                 try {
-                    $params = @{ ClassName = 'Win32_ComputerSystem'; ComputerName = $ComputerName; ErrorAction = 'Stop' }
-                    if ($Cred) { $params.Credential = $Cred }
+                    if ($Cred) {
+                        $cimSession = New-CimSession -ComputerName $ComputerName -Credential $Cred -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
+                        $null = Get-CimInstance -CimSession $cimSession -ClassName 'Win32_ComputerSystem' -ErrorAction Stop
+                    } else {
+                        $null = Get-CimInstance -ComputerName $ComputerName -ClassName 'Win32_ComputerSystem' -ErrorAction Stop
+                    }
                     return @{ Success = $true }
                 } catch {
                     return @{ Success = $false; Error = $_.Exception.Message }
+                } finally {
+                    if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
                 }
             }
             
@@ -2943,20 +2970,30 @@ $GetUpdates = {
                 [string]$ComputerName,
                 [string]$ClassName = 'Win32_ComputerSystem',
                 [int]$TimeoutSeconds = 5,
-                $Credential = $null,
+                # PSCredential (never a plain string) so a password can't leak into logs/UI
+                [pscredential]$Credential = $null,
                 [string]$Operation = 'CIM operation'
             )
             $cimJob = $null
             try {
                 $cimJob = Start-Job -ScriptBlock {
-                    param($ComputerName, $ClassName, $Cred)
+                    # $Cred is always a PSCredential (or $null for default credentials).
+                    # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
+                    # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
+                    param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
+                    $cimSession = $null
                     try {
-                        $params = @{ ClassName = $ClassName; ComputerName = $ComputerName; ErrorAction = 'Stop' }
-                        if ($Cred) { $params.Credential = $Cred }
-                        $result = Get-CimInstance @params
+                        if ($Cred) {
+                            $cimSession = New-CimSession -ComputerName $ComputerName -Credential $Cred -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
+                            $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
+                        } else {
+                            $result = Get-CimInstance -ComputerName $ComputerName -ClassName $ClassName -ErrorAction Stop
+                        }
                         return @{ Success = $true; Result = $result }
                     } catch {
                         return @{ Success = $false; Error = $_.Exception.Message }
+                    } finally {
+                        if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
                     }
                 } -ArgumentList $ComputerName, $ClassName, $Credential
                 $jobCompleted = Wait-Job -Job $cimJob -Timeout $TimeoutSeconds
