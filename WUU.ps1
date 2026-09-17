@@ -251,6 +251,16 @@ $errorSuggestionsHash = [hashtable]::Synchronized(@{
         )
         AutoFix = $false
     }
+    'timed out' = @{
+        Description = 'Operation timed out'
+        Suggestions = @(
+            'Check network connectivity',
+            'Verify target computer is responsive',
+            'Increase timeout settings if needed',
+            'Try again later when network is less busy'
+        )
+        AutoFix = $false
+    }
 })
 
 #endregion Error Suggestions Mapping
@@ -678,15 +688,16 @@ function Invoke-CimWithTimeout {
             # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
             # credentials must go through New-CimSession (DCOM to match the old
             # Get-WmiObject behavior) and Get-CimInstance -CimSession.
+            # DCOM for BOTH paths: Get-CimInstance -ComputerName implies WinRM/WSMAN, which
+            # fails on hosts without a WinRM listener even though DCOM/WMI works (legacy
+            # Get-WmiObject used DCOM) - such hosts were misreported as WMI timeouts.
             param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
             $cimSession = $null
             try {
-                if ($Cred) {
-                    $cimSession = New-CimSession -ComputerName $ComputerName -Credential $Cred -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
-                    $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
-                } else {
-                    $result = Get-CimInstance -ComputerName $ComputerName -ClassName $ClassName -ErrorAction Stop
-                }
+                $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol DCOM) }
+                if ($Cred) { $sessionArgs['Credential'] = $Cred }
+                $cimSession = New-CimSession @sessionArgs -ErrorAction Stop
+                $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
                 return @{ Success = $true; Result = $result }
             } catch {
                 return @{ Success = $false; Error = $_.Exception.Message }
@@ -2369,15 +2380,15 @@ function New-ComputerRunspace {
             # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
             # The probe must actually RUN the query - it validates credentials AND reachability.
             $testCim = {
+                # DCOM for both paths - Get-CimInstance -ComputerName implies WinRM and
+                # fails on WMI-reachable hosts with no WinRM listener (see Invoke-CimWithTimeout).
                 param([string]$ComputerName, [pscredential]$Cred)
                 $cimSession = $null
                 try {
-                    if ($Cred) {
-                        $cimSession = New-CimSession -ComputerName $ComputerName -Credential $Cred -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
-                        $null = Get-CimInstance -CimSession $cimSession -ClassName 'Win32_ComputerSystem' -ErrorAction Stop
-                    } else {
-                        $null = Get-CimInstance -ComputerName $ComputerName -ClassName 'Win32_ComputerSystem' -ErrorAction Stop
-                    }
+                    $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol DCOM) }
+                    if ($Cred) { $sessionArgs['Credential'] = $Cred }
+                    $cimSession = New-CimSession @sessionArgs -ErrorAction Stop
+                    $null = Get-CimInstance -CimSession $cimSession -ClassName 'Win32_ComputerSystem' -ErrorAction Stop
                     return @{ Success = $true }
                 } catch {
                     return @{ Success = $false; Error = $_.Exception.Message }
@@ -2980,15 +2991,15 @@ $GetUpdates = {
                     # $Cred is always a PSCredential (or $null for default credentials).
                     # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
                     # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
+                    # DCOM for BOTH paths: Get-CimInstance -ComputerName implies WinRM/WSMAN
+                    # and times out on WMI/DCOM-reachable hosts without a WinRM listener.
                     param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
                     $cimSession = $null
                     try {
-                        if ($Cred) {
-                            $cimSession = New-CimSession -ComputerName $ComputerName -Credential $Cred -SessionOption (New-CimSessionOption -Protocol DCOM) -ErrorAction Stop
-                            $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
-                        } else {
-                            $result = Get-CimInstance -ComputerName $ComputerName -ClassName $ClassName -ErrorAction Stop
-                        }
+                        $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol DCOM) }
+                        if ($Cred) { $sessionArgs['Credential'] = $Cred }
+                        $cimSession = New-CimSession @sessionArgs -ErrorAction Stop
+                        $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
                         return @{ Success = $true; Result = $result }
                     } catch {
                         return @{ Success = $false; Error = $_.Exception.Message }
@@ -3016,67 +3027,116 @@ $GetUpdates = {
         }
         
         function Invoke-ServiceWithTimeout {
-            param(
-                [string]$ComputerName,
-                [string]$ServiceName = 'wuauserv',
-                [ValidateSet('Check', 'Start', 'Stop', 'Restart')]
-                [string]$Action = 'Check',
-                [int]$TimeoutSeconds = 5,
-                [int]$PostActionDelay = 5
-            )
-            $serviceJob = $null
-            try {
-                $serviceJob = Start-Job -ScriptBlock {
-                    param($ComputerName, $ServiceName, $Action, $Delay)
-                    try {
-                        $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
-                        switch ($Action) {
-                            'Start' {
-                                $service | Start-Service -ErrorAction Stop
-                                Start-Sleep -Seconds $Delay
-                                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
-                                $success = ($service.Status -eq 'Running')
-                            }
-                            'Stop' {
-                                $service | Stop-Service -ErrorAction Stop
-                                Start-Sleep -Seconds $Delay
-                                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
-                                $success = ($service.Status -eq 'Stopped')
-                            }
-                            'Restart' {
-                                $service | Restart-Service -ErrorAction Stop
-                                Start-Sleep -Seconds $Delay
-                                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
-                                $success = ($service.Status -eq 'Running')
-                            }
-                            default { $success = $true }
-                        }
-                        if ($service) {
-                            return @{ Success = $success; Service = $service; Status = $service.Status }
-                        } else {
-                            return @{ Success = $false; Error = 'Service not found or inaccessible' }
-                        }
-                    } catch {
-                        return @{ Success = $false; Error = $_.Exception.Message }
-                    }
-                } -ArgumentList $ComputerName, $ServiceName, $Action, $PostActionDelay
-                $jobCompleted = Wait-Job -Job $serviceJob -Timeout $TimeoutSeconds
-                if ($jobCompleted) {
-                    $serviceResult = Receive-Job -Job $serviceJob
-                    if ($serviceResult) {
-                        return $serviceResult
-                    } else {
-                        return @{ Success = $false; Error = 'No result returned from job' }
-                    }
-                } else {
-                    return @{ Success = $false; Error = "Service $Action timed out after $TimeoutSeconds seconds" }
-                }
-            } catch {
-                return @{ Success = $false; Error = $_.Exception.Message }
-            } finally {
-                if ($serviceJob) { Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue }
+    param(
+        [Parameter(Mandatory=$true)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory=$false)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ServiceName = 'wuauserv',
+
+        [Parameter(Mandatory=$false)]
+        [ValidateSet('Check', 'Start', 'Stop', 'Restart')]
+        [string]$Action = 'Check',
+
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(1, 300)]
+        [int]$TimeoutSeconds = 30,
+
+        [Parameter(Mandatory=$false)]
+        [ValidateRange(0, 60)]
+        [int]$PostActionDelay = 5
+    )
+
+    try {
+        # A service check is a simple remote SCM query.
+        # Do not create a nested PowerShell background job for it.
+        if ($Action -eq 'Check') {
+            $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+
+            return @{
+                Success = $true
+                Service = $service
+                Status  = $service.Status
             }
         }
+
+        # Retain background-job protection for service state changes.
+        $serviceJob = Start-Job -ScriptBlock {
+            param($ComputerName, $ServiceName, $Action, $Delay)
+
+            try {
+                $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+
+                switch ($Action) {
+                    'Start' {
+                        $service | Start-Service -ErrorAction Stop
+                        Start-Sleep -Seconds $Delay
+                        $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                        $success = ($service.Status -eq 'Running')
+                    }
+
+                    'Stop' {
+                        $service | Stop-Service -ErrorAction Stop
+                        Start-Sleep -Seconds $Delay
+                        $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                        $success = ($service.Status -eq 'Stopped')
+                    }
+
+                    'Restart' {
+                        $service | Restart-Service -ErrorAction Stop
+                        Start-Sleep -Seconds $Delay
+                        $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
+                        $success = ($service.Status -eq 'Running')
+                    }
+                }
+
+                return @{
+                    Success = $success
+                    Service = $service
+                    Status  = $service.Status
+                }
+            }
+            catch {
+                return @{
+                    Success = $false
+                    Error   = $_.Exception.Message
+                }
+            }
+
+        } -ArgumentList $ComputerName, $ServiceName, $Action, $PostActionDelay
+
+        if (Wait-Job -Job $serviceJob -Timeout $TimeoutSeconds) {
+            $result = Receive-Job -Job $serviceJob
+
+            if ($result) {
+                return $result
+            }
+
+            return @{
+                Success = $false
+                Error   = 'No result returned from job'
+            }
+        }
+
+        return @{
+            Success = $false
+            Error   = "Service $Action timed out after $TimeoutSeconds seconds"
+        }
+    }
+    catch {
+        return @{
+            Success = $false
+            Error   = $_.Exception.Message
+        }
+    }
+    finally {
+        if ($serviceJob) {
+            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
         
         # Phase gating is handled on the UI thread by Start-PendingUpdateCheck before this job starts.
 
@@ -3267,18 +3327,25 @@ $GetUpdates = {
                 }
                 
                 try {
-                    # Use helper function for service operations (prevents hangs)
+                    # The service status check is a best-effort pre-flight only: wuauserv is
+                    # demand-start, so the COM search below starts it automatically when needed.
+                    # A failed/slow status query must NOT abort the update check (regression fix:
+                    # older WUU never queried the service remotely and did not fail this way).
                     if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                         $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
                     } else {
-                        # Check Windows Update service status
                         $serviceResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Check' -TimeoutSeconds 5
                         
                         if ($serviceResult -and $serviceResult.Success) {
                             $wuService = $serviceResult.Service
                         } else {
-                            $errorMsg = if ($serviceResult -and $serviceResult.Error) { $serviceResult.Error } else { 'Unknown error' }
-                            throw "Service check failed: $errorMsg"
+                            # Non-fatal: log and continue - the COM search will start wuauserv on demand
+                            $warnMsg = if ($serviceResult -and $serviceResult.Error) { $serviceResult.Error } else { 'No result returned' }
+                            if ($EnableDebugLogging) {
+                                $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+                                $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Windows Update service status check failed (continuing): $warnMsg"
+                                Add-Content -Path $LogPath -Value $logEntry -Force
+                            }
                         }
                         
                         if ($wuService -and $wuService.Status -ne 'Running') {
@@ -3288,7 +3355,7 @@ $GetUpdates = {
                             
                             Write-Warning "Windows Update service is not running on $($Computer.computer). Attempting to start..."
                             
-                            # Start the service with timeout
+                            # Best-effort start: failure here is not fatal either (COM search auto-starts)
                             $startResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Start' -TimeoutSeconds 10 -PostActionDelay 5
                             
                             if ($startResult -and $startResult.Success) {
@@ -3299,18 +3366,22 @@ $GetUpdates = {
                                     Add-Content -Path $LogPath -Value $logEntry -Force
                                 }
                             } else {
-                                $errorMsg = if ($startResult -and $startResult.Error) { $startResult.Error } else { 'Unknown error' }
-                                throw "Service start failed: $errorMsg"
+                                $warnMsg = if ($startResult -and $startResult.Error) { $startResult.Error } else { 'Unknown error' }
+                                if ($EnableDebugLogging) {
+                                    $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
+                                    $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Windows Update service start failed (continuing): $warnMsg"
+                                    Add-Content -Path $LogPath -Value $logEntry -Force
+                                }
                             }
                         }
                     }
                 } catch {
+                    # Non-fatal: a slow/failed service query must not kill the update check
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                        $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] Windows Update service issue: $($_.Exception.Message)"
+                        $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Windows Update service pre-flight issue (continuing): $($_.Exception.Message)"
                         Add-Content -Path $LogPath -Value $logEntry -Force
                     }
-                    throw "Windows Update service error: $($_.Exception.Message)"
                 }
                 
                 # Update status for COM object creation
