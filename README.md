@@ -6,9 +6,22 @@ This repo is a consolidated/fixed version of the original Windows Update Utility
 
 ## How this fork differs from the original
 
-The original WUU is a single-threaded-feeling WinForms-style WPF script whose remote checks can hang the UI indefinitely and whose remote operations assume a homogeneous domain. This fork keeps the same UI and workflow, but rebuilds the concurrency, transport, and credential layers. Highlights (full detail in `docs/`):
+The original WUU (Tyler Siegrist, 2016) is a WPF script whose remote checks can hang the UI indefinitely and which only ever used the current user's domain credentials. This fork keeps the same UI and workflow, but adds substantial new capability and rebuilds the concurrency, transport, and credential layers. Full detail in `docs/`.
 
-### Improvements
+### New features (not in the original)
+
+- **Phased deployment** — assign computers to up to 5 deployment phases (Action menu or right-click > *Assign Phase*). A phase's checks don't start until every computer in the previous phase is fully patched and reboot-clean, so you can wave updates across an estate instead of hitting everything at once. Errored/timed-out hosts never block later phases, and phase assignments persist in saved computer lists.
+- **Full automation workflow** — the original only offered auto-reboot after install. New *Auto-download* and *Auto-install* checkboxes enable the complete pipeline per computer: check → download → install → reboot (if required) → re-check.
+- **WSUS audit** — right-click any computer to compare WSUS-assigned updates against the standard Windows Update count, with download states, WSUS server detection, and reboot status (uses `Scripts\Audit-WSUSUpdates.ps1`).
+- **Custom remote credentials** — configure alternate credentials (username/domain/password dialog) for WMI/DCOM queries against non-domain or restricted hosts, with a per-computer credential cache to avoid repeated prompts. Credentials are held as `SecureString` end-to-end.
+- **Encrypted computer-list configs** — save and load computer lists (including phase assignments) protected by a password-derived AES key, replacing the original's plain-text export.
+- **Clipboard list management** — copy full computer details or just status messages; paste a list of computer names straight from the clipboard into the grid.
+- **Active Directory diagnostics** — built-in AD connectivity test (domain join, LDAP, computer search, prerequisites) with actionable results when the AD import fails.
+- **Performance monitoring & job throttling** — CPU/memory/latency thresholds warn before operating on overloaded systems; concurrent update checks are capped (default 10, configurable) so large estates stay responsive.
+- **Resizable, auto-fitting columns** — drag any column grip; the header always spans the window, user-dragged widths are respected, and columns can't be dragged to zero width.
+- **Operator tooling** — stuck-process killer (`Kill-WUU-Processes.ps1`), a release validation script (`Scripts\Validate-Release.ps1`), and headless regression harnesses for the deadlock fixes (`Scripts\Test-*.ps1`).
+
+### Reliability & platform improvements
 
 | Area | Original | This fork |
 |------|----------|-----------|
@@ -16,10 +29,7 @@ The original WUU is a single-threaded-feeling WinForms-style WPF script whose re
 | **Hang protection** | Unbounded remote calls (WMI, service queries, update search) could stall a job forever, starving the job throttle | Every remote call is wrapped with a hard timeout (`Invoke-CimWithTimeout`, `Invoke-ServiceWithTimeout`, `Invoke-RemoteComWithTimeout`); stuck jobs are stopped after 10 minutes and greyed out |
 | **WMI transport** | `Get-WmiObject -ComputerName` (DCOM) — worked without WinRM | **DCOM CIM sessions for both credential paths** (v1.2.1): default-credential probes were briefly routed over WinRM/WSMAN in the enhanced branch, which misreported WMI-reachable hosts as timeouts; now both paths use `New-CimSession -Protocol DCOM`, matching legacy behavior — **no WinRM listener required for update checks** |
 | **Service pre-flight** | None | Best-effort `wuauserv` status check/auto-start that *cannot* abort the update check (it's demand-start; the COM search starts it when needed) |
-| **Credentials** | Current user's domain credentials only, plain-string handling in places | All credential parameters typed `[pscredential]`; custom-credential configuration dialog with per-computer cache; PS 5.1 `Get-CimInstance` has no `-Credential` parameter — alternate credentials go through DCOM `New-CimSession` |
-| **Scale & staging** | All computers checked at once | Job throttling (`$MaxConcurrentJobs`, default 10) plus a 5-phase staging system — later phases wait until earlier ones are fully patched (errored/timed-out hosts never block a phase) |
-| **Saved lists** | Plain-text export | Optional encrypted computer-list config (AES, password-derived key) storing name + phase |
-| **UI polish** | Fixed columns | Auto-fitting, drag-resizable columns with per-column proportions and a 40px minimum; fast WPF credential/password dialogs (no slow Windows credential prompt lag) |
+| **Credential safety** | Plain-string password handling in places | All credential parameters typed `[pscredential]`; PS 5.1 `Get-CimInstance` has no `-Credential` parameter — alternate credentials flow through DCOM `New-CimSession` |
 | **Maintainability** | Duplicate variable names silently shadowing live code (`$RemoveEntry`, `$GetErrors`) | Duplicates removed; runspace-scoped helper injection documented; `Scripts\Validate-Release.ps1` gates releases |
 
 ### Drawbacks / trade-offs
