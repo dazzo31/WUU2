@@ -14,8 +14,6 @@ New-Item -ItemType Directory -Path $staging -Force | Out-Null
 # Core runnable files + docs
 $include = @(
     "WUU.ps1",
-    "WUU.xaml",
-    "OUPicker.xaml",
     "ComputerList.config",
     "Exempt.txt",
     "README.md",
@@ -28,6 +26,18 @@ foreach ($rel in $include) {
     if (Test-Path $src) {
         Copy-Item -Path $src -Destination (Join-Path $staging $rel) -Force
     }
+}
+
+# UI layouts (MainWindow.xaml, CredentialDialog.xaml, OUSelector.xaml)
+$uiSrc = Join-Path $repoRoot "ui"
+if (Test-Path $uiSrc) {
+    Copy-Item -Path $uiSrc -Destination (Join-Path $staging "ui") -Recurse -Force
+}
+
+# src/ modules (WUU.ps1 imports them at startup)
+$srcSrc = Join-Path $repoRoot "src"
+if (Test-Path $srcSrc) {
+    Copy-Item -Path $srcSrc -Destination (Join-Path $staging "src") -Recurse -Force
 }
 
 # Include helper scripts folder
