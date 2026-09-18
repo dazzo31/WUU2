@@ -4261,6 +4261,36 @@ $uiHash.CopyCellContext.Add_Click($eventCopyCellContent) #Copy Cell Content
 #endregion
 
 #region Job scheduler timer
+# Hand the shared app state to Wuu.WindowsUpdate (job/phase functions read $script:WuuCtx).
+# Without this, Start-PendingUpdateCheck silently no-ops on a null context and items
+# stay stuck at "Initializing...". Must run AFTER the payload closures exist and BEFORE
+# the first timer tick.
+$wuuContext = @{
+    UiHash                     = $global:uiHash
+    Jobs                       = $global:jobs
+    UpdatesHash                = $global:updatesHash
+    PerformanceHash            = $global:performanceHash
+    ErrorSuggestions           = $global:errorSuggestionsHash
+    Path                       = $PWD.Path
+    LogPath                    = $global:LogPath
+    LogLock                    = $global:LogLock
+    EnableDebugLogging          = $global:EnableDebugLogging
+    EnableEnhancedErrorHandling = $global:EnableEnhancedErrorHandling
+    UseCustomCredentials        = $global:UseCustomCredentials
+    CustomCredentials           = $global:CustomCredentials
+    CredentialCache             = $global:CredentialCache
+    PerformanceThreshold        = $global:PerformanceThreshold
+    ConfigPaths                 = $global:ConfigPaths
+    SearchTimeout               = $global:searchTimeout
+    SessionTimeout              = $global:sessionTimeout
+    RebootCheckTimeout          = $global:rebootCheckTimeout
+    MaxConcurrentJobs           = $global:MaxConcurrentJobs
+    GetUpdates                  = $GetUpdates
+    BackgroundProcessing        = $global:backgroundProcessing
+    CredDialogXamlPath          = Join-Path $WuuRoot 'ui\CredentialDialog.xaml'
+}
+Initialize-WuuWindowsUpdateContext -Context $wuuContext
+
 # Starts pending update checks from the UI thread without ever blocking it
 $uiHash.JobTimer = New-Object System.Windows.Threading.DispatcherTimer
 $uiHash.JobTimer.Interval = [TimeSpan]::FromSeconds(1)

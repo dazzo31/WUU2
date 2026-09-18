@@ -40,9 +40,11 @@ function New-ComputerRunspace {
         $newRunspace.SessionStateProxy.SetVariable("LogLock",$ctx.LogLock)
         $newRunspace.SessionStateProxy.SetVariable("EnableDebugLogging",$ctx.EnableDebugLogging)
         $newRunspace.SessionStateProxy.SetVariable("EnableEnhancedErrorHandling",$ctx.EnableEnhancedErrorHandling)
-        $newRunspace.SessionStateProxy.SetVariable("UseCustomCredentials",$ctx.UseCustomCredentials)
-        $newRunspace.SessionStateProxy.SetVariable("CustomCredentials",$ctx.CustomCredentials)
-        $newRunspace.SessionStateProxy.SetVariable("CredentialCache",$ctx.CredentialCache)
+        # Read runtime-reassignable credential state at creation time (config dialog
+        # reassigns the $global: variables; the startup context snapshot would be stale).
+        $newRunspace.SessionStateProxy.SetVariable("UseCustomCredentials",$global:UseCustomCredentials)
+        $newRunspace.SessionStateProxy.SetVariable("CustomCredentials",$global:CustomCredentials)
+        $newRunspace.SessionStateProxy.SetVariable("CredentialCache",$global:CredentialCache)
         $newRunspace.SessionStateProxy.SetVariable("PerformanceThreshold",$PerformanceThreshold)
         $newRunspace.SessionStateProxy.SetVariable("ConfigPaths",$ctx.ConfigPaths)
         $newRunspace.SessionStateProxy.SetVariable("searchTimeout",$searchTimeout)
@@ -420,19 +422,22 @@ function Start-UpdateCheckJob {
             }
         }
         
-        # Update status if runspace creation fails
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($ComputerItem)
-            $ComputerItem.Status = "Failed to initialize: $errorMessage"
-            $ComputerItem.UpdatesStatus = 'Error'
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($ComputerItem)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
-            }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        # Update status if runspace creation fails (guard: dispatcher may be absent
+        # during shutdown or in test rigs)
+        if ($uiHash.ListView -and $uiHash.ListView.Dispatcher) {
+            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                $uiHash.Listview.Items.EditItem($ComputerItem)
+                $ComputerItem.Status = "Failed to initialize: $errorMessage"
+                $ComputerItem.UpdatesStatus = 'Error'
+                # Set background color to grey for errored entries
+                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($ComputerItem)
+                if($listViewItem) {
+                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+                }
+                $uiHash.Listview.Items.CommitEdit()
+                $uiHash.Listview.Items.Refresh()
+            })
+        }
         return $false
     }
 }
