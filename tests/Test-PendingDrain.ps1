@@ -10,9 +10,17 @@ $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
 Set-Location $root
 
-foreach ($m in @('Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.WindowsUpdate')) {
-    Import-Module (Join-Path $root "src\$m.psm1") -Force -ErrorAction Stop
-}
+# Import exactly like the real entry point (WUU.ps1 -> Wuu.Core -> Start-WuuApplication):
+# importing the modules directly into this session would MASK cross-module visibility
+# bugs (the exact class of bug this test guards against).
+Import-Module (Join-Path $root 'src\Wuu.Core.psm1') -Force
+Import-WuuModules -WuuRoot $root
+
+# Cross-module visibility probe: Wuu.WindowsUpdate functions must resolve Wuu.Logging
+# exports at call time (this is what failed at runtime and froze items).
+$probe = Get-Command Write-InfoLog -ErrorAction SilentlyContinue
+if (-not $probe) { Write-Host 'FAIL: Write-InfoLog not resolvable after Import-WuuModules' -ForegroundColor Red; exit 1 }
+Write-Host 'PASS: cross-module command resolution (Write-InfoLog visible)' -ForegroundColor Green
 
 # Minimal UI state. A no-op Dispatcher stub lets Start-UpdateCheckJob's catch path
 # (which we are not exercising) complete without a real WPF control.

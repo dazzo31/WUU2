@@ -5,16 +5,20 @@ Application core: startup, environment validation, event wiring, and the GUI loo
 Start-WuuApplication is the composed entry routine invoked by WUU.ps1.
 #>
 
+function Import-WuuModules {
+    # Loads all Wuu modules with -Global (required for cross-module visibility:
+    # session-state isolation hides sibling exports otherwise). Both the app
+    # startup and tests/Test-PendingDrain.ps1 use this single import path.
+    param([Parameter(Mandatory)][string]$WuuRoot)
+    foreach ($m in @('Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.WindowsUpdate')) {
+        Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
+    }
+}
+
 function Start-WuuApplication {
     param([Parameter(Mandatory)][string]$WuuRoot)
 
-    # Dependencies (module function resolution requires explicit imports)
-    Import-Module (Join-Path $WuuRoot "src\Wuu.Logging.psm1")
-    Import-Module (Join-Path $WuuRoot "src\Wuu.Models.psm1")
-    Import-Module (Join-Path $WuuRoot "src\Wuu.Remote.psm1")
-    Import-Module (Join-Path $WuuRoot "src\Wuu.Network.psm1")
-    Import-Module (Join-Path $WuuRoot "src\Wuu.Credentials.psm1")
-    Import-Module (Join-Path $WuuRoot "src\Wuu.WindowsUpdate.psm1")
+    Import-WuuModules -WuuRoot $WuuRoot
 
 <#
 .SYNOPSIS
@@ -4494,5 +4498,5 @@ exit
 #endregion Start the GUI
 }
 
-Export-ModuleMember -Function @('Start-WuuApplication')
+Export-ModuleMember -Function @('Import-WuuModules','Start-WuuApplication')
 
