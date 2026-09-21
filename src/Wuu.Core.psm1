@@ -1247,6 +1247,8 @@ $GetUpdates = {
         }
         
         # Define timeout helpers locally (isolated runspace does not inherit script-scope functions)
+        # Pool-based bounded execution via the injected WuuWorkerPool + InvokePooledScript
+        # (SetVariable'd by New-ComputerRunspace) - was Start-Job per probe.
         function Invoke-CimWithTimeout {
             param(
                 [string]$ComputerName,
@@ -1256,9 +1258,8 @@ $GetUpdates = {
                 [pscredential]$Credential = $null,
                 [string]$Operation = 'CIM operation'
             )
-            $cimJob = $null
             try {
-                $cimJob = Start-Job -ScriptBlock {
+                $cimResult = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock {
                     # $Cred is always a PSCredential (or $null for default credentials).
                     # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
                     # credentials must go through New-CimSession (DCOM) + Get-CimInstance -CimSession.
@@ -1277,23 +1278,20 @@ $GetUpdates = {
                     } finally {
                         if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
                     }
-                } -ArgumentList $ComputerName, $ClassName, $Credential
-                $jobCompleted = Wait-Job -Job $cimJob -Timeout $TimeoutSeconds
-                if ($jobCompleted) {
-                    $cimResult = Receive-Job -Job $cimJob
-                    if ($cimResult -and $cimResult.Success) {
-                        return @{ Success = $true; Result = $cimResult.Result }
+                } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName $Operation
+                if ($cimResult.Success) {
+                    $inner = $cimResult.Result
+                    if ($inner -and $inner.Success) {
+                        return @{ Success = $true; Result = $inner.Result }
                     } else {
-                        $errorMsg = if ($cimResult -and $cimResult.Error) { $cimResult.Error } else { 'Unknown error' }
+                        $errorMsg = if ($inner -and $inner.Error) { $inner.Error } else { 'Unknown error' }
                         return @{ Success = $false; Error = $errorMsg }
                     }
                 } else {
-                    return @{ Success = $false; Error = "$Operation timed out after $TimeoutSeconds seconds" }
+                    return @{ Success = $false; Error = $cimResult.Error }
                 }
             } catch {
                 return @{ Success = $false; Error = $_.Exception.Message }
-            } finally {
-                if ($cimJob) { Remove-Job -Job $cimJob -Force -ErrorAction SilentlyContinue }
             }
         }
         
@@ -1333,8 +1331,9 @@ $GetUpdates = {
             }
         }
 
-        # Retain background-job protection for service state changes.
-        $serviceJob = Start-Job -ScriptBlock {
+        # Retain bounded-execution protection for service state changes via the
+        # injected worker pool (was Start-Job - one child process per action).
+        $poolResult = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock {
             param($ComputerName, $ServiceName, $Action, $Delay)
 
             try {
@@ -1376,35 +1375,27 @@ $GetUpdates = {
                 }
             }
 
-        } -ArgumentList $ComputerName, $ServiceName, $Action, $PostActionDelay
+        } -ArgumentList @($ComputerName, $ServiceName, $Action, $PostActionDelay) -TimeoutSeconds $TimeoutSeconds -OperationName "Service $Action"
 
-        if (Wait-Job -Job $serviceJob -Timeout $TimeoutSeconds) {
-            $result = Receive-Job -Job $serviceJob
-
-            if ($result) {
-                return $result
-            }
-
+        if ($poolResult.Success -and $poolResult.Result) {
+            return $poolResult.Result
+        }
+        if (-not $poolResult.Success) {
             return @{
                 Success = $false
-                Error   = 'No result returned from job'
+                Error   = $poolResult.Error
             }
         }
 
         return @{
             Success = $false
-            Error   = "Service $Action timed out after $TimeoutSeconds seconds"
+            Error   = 'No result returned from pool'
         }
     }
     catch {
         return @{
             Success = $false
             Error   = $_.Exception.Message
-        }
-    }
-    finally {
-        if ($serviceJob) {
-            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
         }
     }
 }
@@ -2166,11 +2157,13 @@ $RestartComputer = {
         })
 
         $onlineWait = 0
-        While($true){ #Wait for computer to come online (each COM probe is bounded by a 10s job)
-            $probeJob = $null
+        While($true){ #Wait for computer to come online (each COM probe is bounded by a 10s pool call)
+            $probeResult = $null
             $probeOk = $false
             try {
-                $probeJob = Start-Job -ScriptBlock {
+                # Pool-based bounded probe (was Start-Job - one child process per retry,
+                # re-spawned every 5 seconds during a 30-minute wait window).
+                $probeResult = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock {
                     param($ComputerName)
                     try {
                         [void][activator]::CreateInstance([type]::GetTypeFromProgID('Microsoft.Update.Session',$ComputerName))
@@ -2178,14 +2171,12 @@ $RestartComputer = {
                     } catch {
                         return $false
                     }
-                } -ArgumentList $Computer.computer
-                if ((Wait-Job -Job $probeJob -Timeout 10) -and (Receive-Job -Job $probeJob)) {
+                } -ArgumentList @($Computer.computer) -TimeoutSeconds 10 -OperationName 'Reboot online probe'
+                if ($probeResult.Success -and $probeResult.Result) {
                     $probeOk = $true
                 }
             } catch {
-                # Job infrastructure failure - treat as not yet online
-            } finally {
-                if ($probeJob) { Remove-Job -Job $probeJob -Force -ErrorAction SilentlyContinue }
+                # Pool infrastructure failure - treat as not yet online
             }
             
             if ($probeOk) { Break }
@@ -4024,8 +4015,9 @@ $WUServiceAction = {
             }
             $result = "Windows Update Service ${Action}ed successfully"
         } else {
-            # Remote: run in a background job with a hard timeout to prevent hangs
-            $serviceJob = Start-Job -ScriptBlock {
+            # Remote: run on the worker pool with a hard timeout to prevent hangs
+            # (was Start-Job - one child process per service action)
+            $poolResult = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock {
                 param($ComputerName, $Action)
                 try {
                     Invoke-Command -ComputerName $ComputerName -ScriptBlock {
@@ -4041,20 +4033,15 @@ $WUServiceAction = {
                 } catch {
                     return @{ Success = $false; Error = $_.Exception.Message }
                 }
-            } -ArgumentList $Computer.Computer, $Action
+            } -ArgumentList @($Computer.Computer, $Action) -TimeoutSeconds 20 -OperationName "Service $Action"
             
-            if (Wait-Job -Job $serviceJob -Timeout 20) {
-                $jobResult = Receive-Job -Job $serviceJob
-                Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
-                if ($jobResult -and $jobResult.Success) {
-                    $result = $jobResult.Message
-                } else {
-                    $errorMsg = if ($jobResult -and $jobResult.Error) { $jobResult.Error } else { 'Service action failed with unknown error' }
-                    throw $errorMsg
-                }
+            if ($poolResult.Success -and $poolResult.Result -and $poolResult.Result.Success) {
+                $result = $poolResult.Result.Message
             } else {
-                Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
-                throw "Service $Action timed out after 20 seconds"
+                $errorMsg = if ($poolResult.Result -and $poolResult.Result.Error) { $poolResult.Result.Error }
+                            elseif ($poolResult.Error) { $poolResult.Error }
+                            else { 'Service action failed with unknown error' }
+                throw $errorMsg
             }
         }
         
