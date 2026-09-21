@@ -651,37 +651,47 @@ function Resume-BackgroundProcessing {
 
 #region ScriptBlocks
 
-# Helper function to safely update ListView items
-# This function is used in runspaces to safely update ListView items
+# Helper function to safely update ListView items (main-session copy).
+# The runspace copy is injected as $SafeUpdateListViewItemScript in
+# New-ComputerRunspace (Wuu.WindowsUpdate.psm1) - keep both in sync.
+# CRITICAL: the dispatcher action below executes on the UI thread while a
+# calling worker runspace may be BLOCKED inside Dispatcher.Invoke waiting for
+# it. Pipeline cmdlets (Where-Object/Select-Object) inside the action would
+# need that busy worker runspace's engine to run -> guaranteed deadlock.
+# Only use PowerShell LANGUAGE constructs (foreach/if/property sets) in here.
 function SafeUpdateListViewItem {
     param(
         [string]$ComputerName,
-        [scriptblock]$UpdateAction
+        [hashtable]$Properties
     )
     
     # Check if GUI is ready and ListView is properly initialized
     if (-not $uiHash.ListView -or -not $uiHash.clientObservable) {
-        Write-Warning "GUI not ready for ListView updates. Skipping update for $ComputerName"
         return
     }
     
     try {
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             # Find the actual item in the ListView that corresponds to this computer
-            $actualItem = $uiHash.Listview.Items | Where-Object { $_.Computer -eq $ComputerName } | Select-Object -First 1
+            # (foreach loop, NOT a Where-Object pipeline - see comment above)
+            $actualItem = $null
+            foreach ($item in $uiHash.Listview.Items) {
+                if ($item.Computer -eq $ComputerName) { $actualItem = $item; break }
+            }
             
             if ($actualItem) {
                 $uiHash.Listview.Items.EditItem($actualItem)
                 
-                # Execute the update action with the actual item
-                & $UpdateAction $actualItem
+                foreach ($propertyName in $Properties.Keys) {
+                    $actualItem.$propertyName = $Properties[$propertyName]
+                }
                 
                 $uiHash.Listview.Items.CommitEdit()
                 $uiHash.Listview.Items.Refresh()
             }
         })
     } catch {
-        Write-Warning "Failed to update ListView for $ComputerName : $($_.Exception.Message)"
+        # Silently ignore ListView update errors during startup
     }
 }
 
