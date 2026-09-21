@@ -25,10 +25,11 @@ function Invoke-CimWithTimeout {
         [string]$Operation = 'CIM operation'
     )
     
-    $cimJob = $null
-    
     try {
-        $cimJob = Start-Job -ScriptBlock {
+        # Pool-based bounded execution (was Start-Job - one child process per probe).
+        # The inner scriptblock is UNCHANGED: DCOM session logic and [pscredential]
+        # typing preserved exactly - only the bounding mechanism is replaced.
+        $cimResult = Invoke-WithPoolTimeout -ScriptBlock {
             # $Cred is always a PSCredential (or $null for default credentials) -
             # typed so a plain-string password can never be passed as a credential.
             # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
@@ -50,26 +51,15 @@ function Invoke-CimWithTimeout {
             } finally {
                 if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
             }
-        } -ArgumentList $ComputerName, $ClassName, $Credential
+        } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName $Operation
         
-        $jobCompleted = Wait-Job -Job $cimJob -Timeout $TimeoutSeconds
-        if ($jobCompleted) {
-            $cimResult = Receive-Job -Job $cimJob
-            if ($cimResult -and $cimResult.Success) {
-                return @{ Success = $true; Result = $cimResult.Result }
-            } else {
-                $errorMsg = if ($cimResult -and $cimResult.Error) { $cimResult.Error } else { 'Unknown error' }
-                return @{ Success = $false; Error = $errorMsg }
-            }
+        if ($cimResult.Success) {
+            return @{ Success = $true; Result = $cimResult.Result }
         } else {
-            return @{ Success = $false; Error = "$Operation timed out after $TimeoutSeconds seconds" }
+            return @{ Success = $false; Error = $cimResult.Error }
         }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
-    } finally {
-        if ($cimJob) {
-            Remove-Job -Job $cimJob -Force -ErrorAction SilentlyContinue
-        }
     }
 }
 
@@ -96,10 +86,10 @@ function Invoke-ServiceWithTimeout {
         [int]$PostActionDelay = 5
     )
     
-    $serviceJob = $null
-    
     try {
-        $serviceJob = Start-Job -ScriptBlock {
+        # Pool-based bounded execution (was Start-Job - one child process per probe).
+        # The inner scriptblock is UNCHANGED - only the bounding mechanism is replaced.
+        $serviceResult = Invoke-WithPoolTimeout -ScriptBlock {
             param($ComputerName, $ServiceName, $Action, $Delay)
             try {
                 $service = Get-Service -Name $ServiceName -ComputerName $ComputerName -ErrorAction Stop
@@ -136,25 +126,19 @@ function Invoke-ServiceWithTimeout {
             } catch {
                 return @{ Success = $false; Error = $_.Exception.Message }
             }
-        } -ArgumentList $ComputerName, $ServiceName, $Action, $PostActionDelay
+        } -ArgumentList @($ComputerName, $ServiceName, $Action, $PostActionDelay) -TimeoutSeconds $TimeoutSeconds -OperationName "Service $Action"
         
-        $jobCompleted = Wait-Job -Job $serviceJob -Timeout $TimeoutSeconds
-        if ($jobCompleted) {
-            $serviceResult = Receive-Job -Job $serviceJob
-            if ($serviceResult) {
-                return $serviceResult
+        if ($serviceResult.Success) {
+            if ($serviceResult.Result) {
+                return $serviceResult.Result
             } else {
                 return @{ Success = $false; Error = 'No result returned from job' }
             }
         } else {
-            return @{ Success = $false; Error = "Service $Action timed out after $TimeoutSeconds seconds" }
+            return @{ Success = $false; Error = $serviceResult.Error }
         }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
-    } finally {
-        if ($serviceJob) {
-            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
-        }
     }
 }
 
@@ -170,9 +154,13 @@ function Test-SystemDependencies {
     
     try {
         # Test RPC with timeout and credential handling
-        $rpcTest = $null
-        $rpcJob = Start-Job -ScriptBlock { 
-            param($comp, [bool]$useDomainCreds, [PSCredential]$altCreds, [hashtable]$credCache)
+        # Pool-based bounded execution (was Start-Job - one child process per probe).
+        $rpcResult = Invoke-WithPoolTimeout -ScriptBlock { 
+            param($comp, [bool]$useCustomCreds, [PSCredential]$customCreds, [hashtable]$credCache)
+            
+            # Guard mirrors GetRemoteCredentialsScript: app initializes the cache,
+            # but a probe must never crash on a $null cache (crash = false negative).
+            if (-not $credCache) { $credCache = @{} }
             
             # Helper function to test credentials
             function Test-RemoteCredentials {
@@ -200,37 +188,36 @@ function Test-SystemDependencies {
                 }
             }
             
+            # Credential resolution mirrors GetRemoteCredentialsScript (the app's
+            # real model): cache hit -> custom -> default. The old parameter names
+            # ($script:UseDomainCredentials/$script:AlternateCredentials) were NEVER
+            # defined after the module split - this exported function silently
+            # reported RPC unreachable for every machine if anyone called it.
             # Check if we have cached credentials for this computer
             if ($credCache.ContainsKey($comp)) {
                 $result = Test-RemoteCredentials -computerName $comp -credential $credCache[$comp]
                 if ($result) { return $result }
             }
             
-            # Try domain credentials first
-            if ($useDomainCreds) {
-                $result = Test-RemoteCredentials -computerName $comp -credential $null
+            # Try custom credentials if configured
+            if ($useCustomCreds -and $customCreds) {
+                $result = Test-RemoteCredentials -computerName $comp -credential $customCreds
                 if ($result) { return $result }
             }
             
-            # Try alternate credentials if available
-            if ($altCreds) {
-                $result = Test-RemoteCredentials -computerName $comp -credential $altCreds
-                if ($result) { return $result }
-            }
+            # Fall back to default credentials
+            $result = Test-RemoteCredentials -computerName $comp -credential $null
+            if ($result) { return $result }
             
             return $null
-        } -ArgumentList $ComputerName, $script:UseDomainCredentials, $script:AlternateCredentials, $global:CredentialCache
-        if (Wait-Job -Job $rpcJob -Timeout 10) {
-            $rpcTest = Receive-Job -Job $rpcJob
-            if ($rpcTest) {
-                $dependencies['RPC'] = $true
-            }
+        } -ArgumentList @($ComputerName, [bool]$global:UseCustomCredentials, $global:CustomCredentials, $global:CredentialCache) -TimeoutSeconds 10 -OperationName 'RPC dependency probe'
+        if ($rpcResult.Success -and $rpcResult.Result) {
+            $dependencies['RPC'] = $true
         }
-        Remove-Job -Job $rpcJob -Force -ErrorAction SilentlyContinue
         
         # Test services with timeout
         if ($dependencies['RPC']) {
-            $serviceJob = Start-Job -ScriptBlock { 
+            $svcResult = Invoke-WithPoolTimeout -ScriptBlock { 
                 param($comp) 
                 try {
                     if ($comp -eq 'localhost' -or $comp -eq $env:COMPUTERNAME) {
@@ -244,19 +231,16 @@ function Test-SystemDependencies {
                 } catch {
                     return $null
                 }
-            } -ArgumentList $ComputerName
+            } -ArgumentList $ComputerName -TimeoutSeconds 10 -OperationName 'Service dependency check'
             
-            if (Wait-Job -Job $serviceJob -Timeout 10) {
-                $services = Receive-Job -Job $serviceJob
-                if ($services) {
-                    $wuService = $services | Where-Object { $_.Name -eq 'wuauserv' }
-                    $regService = $services | Where-Object { $_.Name -eq 'RemoteRegistry' }
-                    
-                    $dependencies['WindowsUpdate'] = $wuService -and $wuService.Status -eq 'Running'
-                    $dependencies['RemoteRegistry'] = $regService -and $regService.Status -eq 'Running'
-                }
+            $services = if ($svcResult.Success) { $svcResult.Result } else { $null }
+            if ($services) {
+                $wuService = $services | Where-Object { $_.Name -eq 'wuauserv' }
+                $regService = $services | Where-Object { $_.Name -eq 'RemoteRegistry' }
+                
+                $dependencies['WindowsUpdate'] = $wuService -and $wuService.Status -eq 'Running'
+                $dependencies['RemoteRegistry'] = $regService -and $regService.Status -eq 'Running'
             }
-            Remove-Job -Job $serviceJob -Force -ErrorAction SilentlyContinue
         }
         
         return $dependencies
@@ -275,35 +259,12 @@ function Invoke-WithTimeout {
     )
     
     try {
-        $job = if ($ArgumentList) {
-            Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
-        } else {
-            Start-Job -ScriptBlock $ScriptBlock
-        }
-        
-        $completed = $false
-        $timeoutCounter = 0
-        
-        while (-not $completed -and $timeoutCounter -lt $TimeoutSeconds) {
-            if ($job.State -eq 'Completed') {
-                $result = Receive-Job -Job $job
-                $completed = $true
-                Remove-Job -Job $job -Force
-                return @{ Success = $true; Result = $result; Error = $null }
-            } elseif ($job.State -eq 'Failed') {
-                $jobError = Receive-Job -Job $job 2>&1
-                Remove-Job -Job $job -Force
-                return @{ Success = $false; Result = $null; Error = "$OperationName failed: $($jobError | Out-String)" }
-            } else {
-                Start-Sleep -Seconds 2
-                $timeoutCounter += 2
-            }
-        }
-        
-        # Timeout occurred
-        Remove-Job -Job $job -Force
-        return @{ Success = $false; Result = $null; Error = "$OperationName timed out after $($TimeoutSeconds/60) minutes" }
-        
+        # Pool-based bounded execution (was a polled Start-Job loop).
+        # No callers in the codebase today, but the contract is preserved
+        # exactly in case future code (or the exported name) is used.
+        return Invoke-WithPoolTimeout -ScriptBlock $ScriptBlock `
+            -ArgumentList $ArgumentList -TimeoutSeconds $TimeoutSeconds `
+            -OperationName $OperationName
     } catch {
         return @{ Success = $false; Result = $null; Error = "$OperationName error: $($_.Exception.Message)" }
     }
