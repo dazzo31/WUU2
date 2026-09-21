@@ -10,7 +10,7 @@ function Import-WuuModules {
     # session-state isolation hides sibling exports otherwise). Both the app
     # startup and tests/Test-PendingDrain.ps1 use this single import path.
     param([Parameter(Mandatory)][string]$WuuRoot)
-    foreach ($m in @('Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.WindowsUpdate')) {
+    foreach ($m in @('Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
