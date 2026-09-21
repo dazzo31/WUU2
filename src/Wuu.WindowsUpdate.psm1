@@ -52,6 +52,11 @@ function New-ComputerRunspace {
         $newRunspace.SessionStateProxy.SetVariable("rebootCheckTimeout",$rebootCheckTimeout)
         # ui/ layout file for the worker-side credential dialog (workers have no $PSScriptRoot)
         $newRunspace.SessionStateProxy.SetVariable("CredDialogXamlPath", $ctx.CredDialogXamlPath)
+        # Shared worker pool for bounded probes (isolated runspaces cannot see
+        # module functions - the pool OBJECT and an unbound invoke script are
+        # injected together; see New-PooledInvokeScript in Wuu.Workers.psm1)
+        $newRunspace.SessionStateProxy.SetVariable('WuuWorkerPool', (Get-WuuWorkerPool))
+        $newRunspace.SessionStateProxy.SetVariable('InvokePooledScript', (New-PooledInvokeScript))
         
         # Add required functions to runspace by embedding them as script blocks
         # Unbound ([scriptblock]::Create) so invocation binds to the worker runspace where these variables exist
@@ -238,7 +243,8 @@ function New-ComputerRunspace {
                 return $CredentialCache[$ComputerName]
             }
             
-            # Inline timeout helper: runs a CIM probe in a background job with a hard timeout
+            # Inline timeout helper: runs a CIM probe on the shared worker pool with a
+            # hard timeout. Was Start-Job (one child process per probe, two per computer).
             # $Cred is always a PSCredential (or $null for default credentials) - typed so a
             # plain-string password can never be passed as a credential.
             # NOTE: PS 5.1's Get-CimInstance has NO -Credential parameter; alternate
@@ -265,17 +271,12 @@ function New-ComputerRunspace {
             # Try custom credentials first if configured
             if ($UseCustomCredentials -and $CustomCredentials) {
                 try {
-                    $job = Start-Job -ScriptBlock $testCim -ArgumentList $ComputerName, $CustomCredentials
-                    if (Wait-Job -Job $job -Timeout 5) {
-                        $result = Receive-Job -Job $job
-                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-                        if ($result -and $result.Success) {
-                            if (-not $CredentialCache) { $CredentialCache = @{} }
-                            $CredentialCache[$ComputerName] = $CustomCredentials
-                            return $CustomCredentials
-                        }
-                    } else {
-                        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                    $result = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock $testCim `
+                        -ArgumentList @($ComputerName, $CustomCredentials) -TimeoutSeconds 5 -OperationName 'Credential probe (custom)'
+                    if ($result -and $result.Success -and $result.Result -and $result.Result.Success) {
+                        if (-not $CredentialCache) { $CredentialCache = @{} }
+                        $CredentialCache[$ComputerName] = $CustomCredentials
+                        return $CustomCredentials
                     }
                 } catch {
                     try {
@@ -286,17 +287,12 @@ function New-ComputerRunspace {
             
             # Custom credentials failed or not configured, try default credentials
             try {
-                $job = Start-Job -ScriptBlock $testCim -ArgumentList $ComputerName, $null
-                if (Wait-Job -Job $job -Timeout 5) {
-                    $result = Receive-Job -Job $job
-                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-                    if ($result -and $result.Success) {
-                        if (-not $CredentialCache) { $CredentialCache = @{} }
-                        $CredentialCache[$ComputerName] = $null  # null means use default credentials
-                        return $null
-                    }
-                } else {
-                    Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+                $result = & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock $testCim `
+                    -ArgumentList @($ComputerName, $null) -TimeoutSeconds 5 -OperationName 'Credential probe (default)'
+                if ($result -and $result.Success -and $result.Result -and $result.Result.Success) {
+                    if (-not $CredentialCache) { $CredentialCache = @{} }
+                    $CredentialCache[$ComputerName] = $null  # null means use default credentials
+                    return $null
                 }
             } catch {
                 try {

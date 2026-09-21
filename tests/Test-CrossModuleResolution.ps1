@@ -65,6 +65,35 @@ if ($item.Runspace) {
     $logged = Select-String -Path $global:LogPath -Pattern 'Creating runspace for computer: localhost'
     if ($logged) { Write-Host 'PASS: Write-InfoLog entry landed in the debug log' -ForegroundColor Green }
     else { Write-Host 'FAIL: no log entry - logging silently skipped' -ForegroundColor Red; exit 1 }
+
+    # Pool injection check: the worker runspace must carry WuuWorkerPool +
+    # InvokePooledScript (SetVariable'd by New-ComputerRunspace) and they must
+    # WORK there - the exact path GetRemoteCredentialsScript's probes take.
+    $poolCheckPs = [powershell]::Create()
+    $poolCheckPs.Runspace = $item.Runspace
+    [void]$poolCheckPs.AddScript({
+        $probe = {
+            param($ComputerName)
+            if ($ComputerName -eq 'localhost') { @{ Success = $true } } else { @{ Success = $false } }
+        }
+        & $InvokePooledScript -Pool $WuuWorkerPool -ScriptBlock $probe `
+            -ArgumentList @('localhost') -TimeoutSeconds 8 -OperationName 'pool-injection-check'
+    })
+    $poolHandle = $poolCheckPs.BeginInvoke()
+    if ($poolHandle.AsyncWaitHandle.WaitOne([System.TimeSpan]::FromSeconds(15))) {
+        $poolOut = $poolCheckPs.EndInvoke($poolHandle)
+        if ($poolOut -and $poolOut.Count -gt 0 -and $poolOut[0].Success -and $poolOut[0].Result.Success) {
+            Write-Host 'PASS: injected WuuWorkerPool + InvokePooledScript work inside worker runspace' -ForegroundColor Green
+        } else {
+            Write-Host 'FAIL: injected pool variables present but probe returned failure' -ForegroundColor Red
+            exit 1
+        }
+    } else {
+        Write-Host 'FAIL: pool injection check timed out in worker runspace' -ForegroundColor Red
+        exit 1
+    }
+    try { $poolCheckPs.Dispose() } catch { }
+
     $item.Runspace.Close(); $item.Runspace.Dispose()
     Write-Host 'ALL PASS' -ForegroundColor Cyan
 } else {
