@@ -18,20 +18,22 @@ function Invoke-RemoteComWithTimeout {
         [int]$TimeoutSeconds = 30
     )
     
-    $comJob = $null
+    # Pool-based bounded execution (was Start-Job - one child process per call).
+    # Callers consume the 'Output' key (3 sites in Wuu.Core.psm1: eventShowInstalledUpdates,
+    # eventAuditWSUSUpdates, eventShowUpdateHistory) - contract preserved exactly.
+    # WUA COM safety: callers project COM results to PSCustomObject INSIDE the
+    # scriptblock, so no live COM interface ever crosses the runspace boundary.
     try {
-        $comJob = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ComputerName
+        $result = Invoke-WithPoolTimeout -ScriptBlock $ScriptBlock `
+            -ArgumentList $ComputerName -TimeoutSeconds $TimeoutSeconds `
+            -OperationName 'Remote COM operation'
         
-        if (Wait-Job -Job $comJob -Timeout $TimeoutSeconds) {
-            $output = Receive-Job -Job $comJob
-            Remove-Job -Job $comJob -Force -ErrorAction SilentlyContinue
-            return @{ Success = $true; Output = $output }
+        if ($result.Success) {
+            return @{ Success = $true; Output = $result.Result }
         } else {
-            Remove-Job -Job $comJob -Force -ErrorAction SilentlyContinue
-            return @{ Success = $false; Error = "Operation timed out after $TimeoutSeconds seconds" }
+            return @{ Success = $false; Error = $result.Error }
         }
     } catch {
-        if ($comJob) { Remove-Job -Job $comJob -Force -ErrorAction SilentlyContinue }
         return @{ Success = $false; Error = $_.Exception.Message }
     }
 }
