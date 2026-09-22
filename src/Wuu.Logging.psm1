@@ -4,6 +4,46 @@
 Thread-safe debug logging and level wrappers.
 #>
 
+function Write-WuuLogEntry {
+    <#
+    .SYNOPSIS
+    Fault-tolerant append of one log line. NEVER throws into the caller.
+    .DESCRIPTION
+    Debug logs written into OneDrive-synced folders hit "Stream was not
+    readable" when the sync engine transiently locks/hydrates the file
+    mid-write (PS 5.1 Add-Content opens with restrictive sharing). A logging
+    failure must never kill a timer tick, a runspace creation, or a worker
+    payload, so: take $LogLock, retry briefly, swallow the rest.
+    Inline payload writes should delegate here instead of raw Add-Content.
+    .NOTES
+    Reads $global:LogPath / $global:LogLock (main session); callers inside
+    isolated runspaces should pass -LogPath/-LogLock explicitly.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [string]$LogPath = $global:LogPath,
+        [object]$LogLock = $global:LogLock,
+        [int]$MaxAttempts = 3
+    )
+    
+    if (-not $LogPath) { return }
+    if (-not $LogLock) { $LogLock = New-Object System.Object }
+    
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        $lockTaken = $false
+        try {
+            [System.Threading.Monitor]::Enter($LogLock); $lockTaken = $true
+            Add-Content -Path $LogPath -Value $Message -Force
+            return
+        } catch {
+            if ($attempt -ge $MaxAttempts) { return }   # give up silently
+            Start-Sleep -Milliseconds (100 * $attempt)   # brief backoff
+        } finally {
+            if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
+        }
+    }
+}
+
 function Write-DebugLog {
     param(
         [string]$Message,
@@ -20,13 +60,8 @@ function Write-DebugLog {
     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
     $logEntry = "[$timestamp] [$Level]$(if($Computer){" [$Computer]"}) $Message"
     
-    # Thread-safe logging
-    [System.Threading.Monitor]::Enter($global:LogLock)
-    try {
-        Add-Content -Path $global:LogPath -Value $logEntry -Force
-    } finally {
-        [System.Threading.Monitor]::Exit($global:LogLock)
-    }
+    # Fault-tolerant append (never throws - see Write-WuuLogEntry)
+    Write-WuuLogEntry -Message $logEntry
     
     if ($ToConsole) {
         Write-Host $logEntry -ForegroundColor $(switch($Level){
@@ -59,5 +94,5 @@ function Write-SuccessLog {
     Write-DebugLog $Message -Level 'SUCCESS' -Computer $Computer
 }
 
-Export-ModuleMember -Function @('Write-DebugLog', 'Write-InfoLog', 'Write-WarningLog', 'Write-ErrorLog', 'Write-SuccessLog')
+Export-ModuleMember -Function @('Write-WuuLogEntry', 'Write-DebugLog', 'Write-InfoLog', 'Write-WarningLog', 'Write-ErrorLog', 'Write-SuccessLog')
 

@@ -136,7 +136,28 @@ $global:errorSuggestionsHash = New-WuuErrorSuggestions
 #region Logging
 
 # Initialize logging
-$global:LogPath = Join-Path $WuuRoot "WUU_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
+# Debug logs are written to %TEMP% (or a non-cloud-synced fallback) instead of the
+# repo root: when the repo lives under OneDrive, the sync engine transiently locks
+# log files mid-write (Files-On-Demand placeholder hydration) and PS 5.1's
+# Add-Content throws "Stream was not readable" - the error that killed timer ticks
+# and runspace creation. %TEMP% is never cloud-synced. Write-DebugLog itself is
+# fault-tolerant (Write-WuuLogEntry), so even a locked log can no longer crash ops.
+$logDir = $env:TEMP
+try {
+    # Defensive: some environments redirect TEMP into a synced location
+    $cur = Get-Item $logDir -Force -ErrorAction Stop
+    while ($cur) {
+        if ($cur.Attributes -band [IO.FileAttributes]::ReparsePoint) { $logDir = $null; break }
+        $parent = Split-Path $cur.FullName -Parent
+        if (-not $parent) { break }
+        $cur = Get-Item $parent -Force -ErrorAction Stop
+    }
+} catch { $logDir = $null }
+if (-not $logDir) {
+    $logDir = Join-Path ([Environment]::GetFolderPath('LocalApplicationData')) 'WUU2\Logs'
+    New-Item -ItemType Directory -Path $logDir -Force | Out-Null
+}
+$global:LogPath = Join-Path $logDir "WUU_Debug_$(Get-Date -Format 'yyyyMMdd_HHmmss').log"
 $global:LogLock = New-Object System.Object
 
 # Logging function
@@ -1189,7 +1210,7 @@ $GetUpdates = {
         if ($EnableDebugLogging) {
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Started GetUpdates for $($Computer.Computer)"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
         }
         
         # Define simplified logging function
@@ -1427,7 +1448,7 @@ $GetUpdates = {
             if ($EnableDebugLogging) {
                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                 $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Checking system dependencies for $($Computer.Computer)"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                & $WriteLogFileScript $logEntry
             }
             $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
@@ -1441,7 +1462,7 @@ $GetUpdates = {
             if ($EnableDebugLogging) {
                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                 $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Skipping dependency checks for stability"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                & $WriteLogFileScript $logEntry
             }
             
             $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
@@ -1475,7 +1496,7 @@ $GetUpdates = {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Using default performance values for stability"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                     
                     # Check performance thresholds
@@ -1508,7 +1529,7 @@ $GetUpdates = {
                 if ($EnableDebugLogging) {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                     $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Testing connectivity with 2s timeout"
-                    Add-Content -Path $LogPath -Value $logEntry -Force
+                    & $WriteLogFileScript $logEntry
                 }
                 
                 # Ping test (PS 5.1-compatible; -TimeoutSeconds is a PS6+ parameter)
@@ -1534,7 +1555,7 @@ $GetUpdates = {
                 if ($EnableDebugLogging) {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                     $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Ping successful"
-                    Add-Content -Path $LogPath -Value $logEntry -Force
+                    & $WriteLogFileScript $logEntry
                 }
                 
                 # Test WMI connectivity
@@ -1546,7 +1567,7 @@ $GetUpdates = {
                 if ($EnableDebugLogging) {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                     $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Starting WMI connectivity test with timeout"
-                    Add-Content -Path $LogPath -Value $logEntry -Force
+                    & $WriteLogFileScript $logEntry
                 }
                 
                 $wmiTest = $null
@@ -1554,7 +1575,7 @@ $GetUpdates = {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Using localhost WMI connection"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                     $wmiTest = Get-CimInstance -ClassName Win32_ComputerSystem -ErrorAction Stop
                 } else {
@@ -1562,7 +1583,7 @@ $GetUpdates = {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Testing WMI via helper function (5s timeout)"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                     
                     $wmiResult = Invoke-CimWithTimeout -ComputerName $Computer.computer -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Operation 'WMI connectivity test'
@@ -1606,7 +1627,7 @@ $GetUpdates = {
                             if ($EnableDebugLogging) {
                                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                                 $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Windows Update service status check failed (continuing): $warnMsg"
-                                Add-Content -Path $LogPath -Value $logEntry -Force
+                                & $WriteLogFileScript $logEntry
                             }
                         }
                         
@@ -1625,14 +1646,14 @@ $GetUpdates = {
                                 if ($EnableDebugLogging) {
                                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                                     $logEntry = "[$timestamp] [SUCCESS] [$($Computer.Computer)] Windows Update service started successfully"
-                                    Add-Content -Path $LogPath -Value $logEntry -Force
+                                    & $WriteLogFileScript $logEntry
                                 }
                             } else {
                                 $warnMsg = if ($startResult -and $startResult.Error) { $startResult.Error } else { 'Unknown error' }
                                 if ($EnableDebugLogging) {
                                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                                     $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Windows Update service start failed (continuing): $warnMsg"
-                                    Add-Content -Path $LogPath -Value $logEntry -Force
+                                    & $WriteLogFileScript $logEntry
                                 }
                             }
                         }
@@ -1642,7 +1663,7 @@ $GetUpdates = {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Windows Update service pre-flight issue (continuing): $($_.Exception.Message)"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                 }
                 
@@ -1673,7 +1694,7 @@ $GetUpdates = {
                             if ($EnableDebugLogging) {
                                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                                 $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Direct COM creation failed, this is expected for cross-domain scenarios: $($_.Exception.Message)"
-                                Add-Content -Path $LogPath -Value $logEntry -Force
+                                & $WriteLogFileScript $logEntry
                             }
                             throw "Remote COM object creation failed. This often occurs in cross-domain scenarios. Consider using PsExec for cross-domain Windows Update management."
                         }
@@ -1688,7 +1709,7 @@ $GetUpdates = {
                         if ($EnableDebugLogging) {
                             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                             $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] Failed to create Windows Update session on $($Computer.Computer): $($_.Exception.Message)"
-                            Add-Content -Path $LogPath -Value $logEntry -Force
+                            & $WriteLogFileScript $logEntry
                         }
                         throw "Failed to create Windows Update session: $($_.Exception.Message)"
                     }
@@ -1775,7 +1796,7 @@ $GetUpdates = {
                     if ($EnableDebugLogging) {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Progress UI update skipped due to threading issue"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                 }
             }
@@ -1802,7 +1823,7 @@ $GetUpdates = {
         if ($EnableDebugLogging) {
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Update search completed successfully"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
         }
 
         #Save update info in hash to view with 'Show Available Updates'
@@ -1820,7 +1841,7 @@ $GetUpdates = {
         if ($EnableDebugLogging) {
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Found $($searchresult.Updates.Count) available updates, $dlCount downloaded"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
         }
 
         # Check pending-reboot state BEFORE the UI update that reports it (bounded so a hung COM call cannot block the job)
@@ -1850,7 +1871,7 @@ $GetUpdates = {
         if ($EnableDebugLogging) {
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Reboot required: $rebootRequired"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
         }
 
         # Update UI in a safer way that avoids cross-thread exceptions
@@ -1884,7 +1905,7 @@ $GetUpdates = {
             if ($EnableDebugLogging) {
                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                 $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] UI update skipped due to threading issue"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                & $WriteLogFileScript $logEntry
             }
         }
 
@@ -1921,7 +1942,7 @@ $GetUpdates = {
             }
             
             $logEntry = "[$timestamp] [INFO] [$($Computer.Computer)] Final Status: $statusMessage"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
         }
         
         #Auto-download if enabled and there are updates available
@@ -1949,18 +1970,18 @@ $GetUpdates = {
         if ($EnableDebugLogging) {
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] GetUpdates failed: $($_.Exception.Message)"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
             
             $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] Error type: $($_.Exception.GetType().FullName)"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
             
             if ($_.Exception.InnerException) {
                 $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] Inner exception: $($_.Exception.InnerException.Message)"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                & $WriteLogFileScript $logEntry
             }
             
             $logEntry = "[$timestamp] [ERROR] [$($Computer.Computer)] Stack trace: $($_.ScriptStackTrace)"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            & $WriteLogFileScript $logEntry
         }
         
         # Create meaningful error message
@@ -2226,7 +2247,27 @@ $newRunspace.SessionStateProxy.SetVariable('jobCleanup',$jobCleanup)
 $newRunspace.SessionStateProxy.SetVariable('jobs',$jobs)
 $newRunspace.SessionStateProxy.SetVariable('uiHash',$uiHash)
 $newRunspace.SessionStateProxy.SetVariable('LogPath',$global:LogPath)
+$newRunspace.SessionStateProxy.SetVariable('LogLock',$global:LogLock)
 $newRunspace.SessionStateProxy.SetVariable('backgroundProcessing',$backgroundProcessing)
+# Fault-tolerant log append for the cleanup loop (same lock+retry semantics
+# as WriteWuuLogEntry; takes pre-formatted lines - see Wuu.Logging.psm1)
+$newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', [scriptblock]::Create({
+    param([string]$LogEntry)
+    $maxAttempts = 3
+    for ($attempt = 1; $attempt -le $maxAttempts; $attempt++) {
+        $lockTaken = $false
+        try {
+            [System.Threading.Monitor]::Enter($LogLock); $lockTaken = $true
+            Add-Content -Path $LogPath -Value $LogEntry -Force
+            break
+        } catch {
+            if ($attempt -ge $maxAttempts) { return }   # give up silently
+            Start-Sleep -Milliseconds (100 * $attempt)
+        } finally {
+            if ($lockTaken) { [System.Threading.Monitor]::Exit($LogLock) }
+        }
+    }
+}.ToString()))
 $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
     #Routine to handle completed runspaces
     Do {
@@ -2244,16 +2285,16 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     try {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [INFO] Job completed for computer: $($runspace.Computer)"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
 
                         $runspace.powershell.EndInvoke($runspace.Runspace) | Out-Null
 
                         $logEntry = "[$timestamp] [INFO] Successfully cleaned up job for computer: $($runspace.Computer)"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     } catch {
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [ERROR] Failed to cleanup job for computer $($runspace.Computer): $($_.Exception.Message)"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                     # Always dispose and drop the job so a failed EndInvoke is not retried forever
                     try { $runspace.powershell.dispose() } catch { $null = $_ }
@@ -2266,7 +2307,7 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                 ElseIf ($runspace.StartTime -and ((Get-Date) - $runspace.StartTime).TotalMinutes -gt 10) {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                     $logEntry = "[$timestamp] [WARN] [$($runspace.Computer)] Job timeout detected for $($runspace.Computer) - running for $([math]::Round(((Get-Date) - $runspace.StartTime).TotalMinutes, 2)) minutes"
-                    Add-Content -Path $LogPath -Value $logEntry -Force
+                    & $WriteLogFileScript $logEntry
 
                     $timedOutComputer = $runspace.Computer
                     try { $runspace.powershell.Stop() } catch { $null = $_ }
@@ -2302,7 +2343,7 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                         # If UI update fails, just log it
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                         $logEntry = "[$timestamp] [WARN] Timeout UI update skipped for ${timedOutComputer}: $($_.Exception.Message)"
-                        Add-Content -Path $LogPath -Value $logEntry -Force
+                        & $WriteLogFileScript $logEntry
                     }
                 }
             }
@@ -2311,7 +2352,7 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
             if ($jobsToRemove.Count -gt 0) {
                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                 $logEntry = "[$timestamp] [INFO] Removing $($jobsToRemove.Count) completed job(s)"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                & $WriteLogFileScript $logEntry
             }
 
             ForEach($job in $jobsToRemove) {
@@ -2322,7 +2363,7 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
             try {
                 $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                 $logEntry = "[$timestamp] [ERROR] Job cleanup loop iteration failed: $($_.Exception.Message)"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                & $WriteLogFileScript $logEntry
             } catch { $null = $_ }
         }
 
@@ -3649,13 +3690,13 @@ $eventRightClick = {
         if ($EnableDebugLogging) {
             $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
             $logEntry = "[$timestamp] [ERROR] Right-click context menu crash: $($_.Exception.GetType().FullName) - $($_.Exception.Message)"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            Write-WuuLogEntry -Message $logEntry
             if ($_.Exception.InnerException) {
                 $logEntry = "[$timestamp] [ERROR] Inner exception: $($_.Exception.InnerException.Message)"
-                Add-Content -Path $LogPath -Value $logEntry -Force
+                Write-WuuLogEntry -Message $logEntry
             }
             $logEntry = "[$timestamp] [ERROR] Stack trace: $($_.ScriptStackTrace)"
-            Add-Content -Path $LogPath -Value $logEntry -Force
+            Write-WuuLogEntry -Message $logEntry
         }
     }
     Write-InfoLog "Right-click processing completed"
