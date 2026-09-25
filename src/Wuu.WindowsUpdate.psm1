@@ -50,6 +50,13 @@ function New-ComputerRunspace {
         $newRunspace.SessionStateProxy.SetVariable("searchTimeout",$searchTimeout)
         $newRunspace.SessionStateProxy.SetVariable("sessionTimeout",$sessionTimeout)
         $newRunspace.SessionStateProxy.SetVariable("rebootCheckTimeout",$rebootCheckTimeout)
+        $newRunspace.SessionStateProxy.SetVariable("CimTimeoutSeconds",$ctx.CimTimeoutSeconds)
+        $newRunspace.SessionStateProxy.SetVariable("ServiceTimeoutSeconds",$ctx.ServiceTimeoutSeconds)
+        $newRunspace.SessionStateProxy.SetVariable("PerformanceTimeoutSeconds",$ctx.PerformanceTimeoutSeconds)
+        $newRunspace.SessionStateProxy.SetVariable("CredProbeTimeoutSeconds",$ctx.CredProbeTimeoutSeconds)
+        $newRunspace.SessionStateProxy.SetVariable("RebootProbeTimeoutSeconds",$ctx.RebootProbeTimeoutSeconds)
+        $newRunspace.SessionStateProxy.SetVariable("OfflineWaitSeconds",$ctx.OfflineWaitSeconds)
+        $newRunspace.SessionStateProxy.SetVariable("OnlineWaitSeconds",$ctx.OnlineWaitSeconds)
         # ui/ layout file for the worker-side credential dialog (workers have no $PSScriptRoot)
         $newRunspace.SessionStateProxy.SetVariable("CredDialogXamlPath", $ctx.CredDialogXamlPath)
         # Shared worker pool for bounded probes (isolated runspaces cannot see
@@ -152,7 +159,72 @@ function New-ComputerRunspace {
                 # Silently ignore ListView update errors during startup
             }
         }.ToString()))
-        
+
+        # Timeout state helper for worker runspaces. Mirrors Set-ComputerTimeout in
+        # Wuu.Core.psm1 but uses only language constructs + the injected $uiHash so
+        # it is safe to invoke from an isolated runspace.
+        $newRunspace.SessionStateProxy.SetVariable('SetComputerTimeoutScript', [scriptblock]::Create({
+            param(
+                [Parameter(Mandatory)][object]$Computer,
+                [Parameter(Mandatory)][string]$Phase,
+                [Parameter(Mandatory)][int]$TimeoutSec,
+                [string]$Detail = ''
+            )
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
+                    $uiHash.Listview.Items.EditItem($Computer)
+                    $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
+                    $Computer.TimeoutSource    = $Phase
+                    $Computer.UpdatesStatus    = 'Timeout'
+                    $Computer.State            = 'Timeout'
+                    $detailSuffix = if ($Detail) { " $Detail" } else { '' }
+                    $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
+                    $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
+                    if ($listViewItem) { $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow }
+                    $uiHash.Listview.Items.CommitEdit()
+                })
+            } catch { }
+        }.ToString()))
+
+        # State machine helper for worker runspaces. Mirrors Set-ComputerState in
+        # Wuu.Core.psm1.
+        $newRunspace.SessionStateProxy.SetVariable('SetComputerStateScript', [scriptblock]::Create({
+            param(
+                [Parameter(Mandatory)][object]$Computer,
+                [Parameter(Mandatory)][string]$State,
+                [string]$StatusDetail = ''
+            )
+            $stateToStatus = @{
+                'Queued'          = 'Waiting to start...'
+                'Connecting'      = 'Testing Connectivity.'
+                'Connected'       = 'Online.'
+                'Checking'        = 'Initializing update session...'
+                'Searching'       = 'Checking for updates...'
+                'UpdatesFound'    = 'Updates found.'
+                'Downloading'     = 'Downloading updates...'
+                'Installing'      = 'Installing updates...'
+                'RebootRequired'  = 'Reboot required.'
+                'Rebooting'       = 'Restarting...'
+                'Verifying'       = 'Verifying post-reboot state...'
+                'Complete'        = 'All updates installed.'
+                'Timeout'         = 'Operation timed out (recoverable).'
+                'Error'           = 'Error occurred.'
+            }
+            $statusString = $stateToStatus[$State]
+            if ($StatusDetail) { $statusString += " $StatusDetail" }
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
+                    $uiHash.Listview.Items.EditItem($Computer)
+                    $Computer.State = $State
+                    $Computer.Status = $statusString
+                    $uiHash.Listview.Items.CommitEdit()
+                })
+            } catch { }
+        }.ToString()))
+
+        # Single source of truth lives in Wuu.Remote.psm1; unbound copy so it runs in the worker runspace
+        $newRunspace.SessionStateProxy.SetVariable('InvokeRemoteTaskScript', [scriptblock]::Create((Get-Command -Name 'Invoke-WuuRemoteTask' -CommandType Function -ErrorAction Stop).ScriptBlock.ToString()))
+
         # Add custom credential dialog script to runspace
         $newRunspace.SessionStateProxy.SetVariable('ShowCustomCredentialDialogScript', [scriptblock]::Create({
             param(
@@ -476,12 +548,21 @@ function Start-PendingUpdateCheck {
     $backgroundProcessing = $ctx.BackgroundProcessing; $uiHash = $ctx.UiHash
     $jobs = $ctx.Jobs; $MaxConcurrentJobs = $ctx.MaxConcurrentJobs
     if ($backgroundProcessing.Suspended) { return }
+    # Promote due Phase-E timeout retries (RetryAt set by $GetUpdates) back into the pending queue
+    $now = [DateTime]::Now
+    foreach ($item in @($uiHash.Listview.Items)) {
+        if ($item.PSObject.Properties['RetryAt'] -and $item.RetryAt -and $item.RetryAt -le $now) {
+            $item.RetryAt = $null
+            $item.Pending = $true
+        }
+    }
     $pendingItems = @($uiHash.Listview.Items | Where-Object { $_.Pending })
     foreach ($item in $pendingItems) {
         if ($jobs.Count -ge $MaxConcurrentJobs) { break }
         if (-not (Test-PhaseReady -Phase $item.Phase)) {
             if ($item.Status -notlike 'Waiting for previous phase*') {
                 $item.Status = "Waiting for previous phase to complete. Current phase: $($item.Phase)"
+                if ($item.PSObject.Properties['State']) { $item.State = 'Queued' }
                 $uiHash.Listview.Items.Refresh()
             }
             continue

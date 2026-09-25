@@ -15,7 +15,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 
-# WUU must run from its own folder (psexec.exe, Scripts\, ui\, src\ are relative to here)
+# WUU must run from its own folder (Scripts\, ui\, src\ are relative to here)
 $wuuRoot = Split-Path $MyInvocation.MyCommand.Path
 Set-Location $wuuRoot
 

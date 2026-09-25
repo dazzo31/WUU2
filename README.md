@@ -36,7 +36,7 @@ The original WUU (Tyler Siegrist, 2016) is a WPF script whose remote checks can 
 
 - **Elevation + STA required** — same as the original; the tool is admin-only by design.
 - **WinRM is still used by the service *actions*** — the Start/Stop/Restart `wuauserv` menu items and RPC auto-recovery go through `Invoke-Command` (PS7-compatible remoting). *Update checks themselves are WinRM-free*; only those optional actions need a WinRM listener.
-- **`psexec.exe` still required** for remote download/install (not bundled — Sysinternals license); the script offers to download it on first run.
+- **Download/install run as a temporary SYSTEM scheduled task on the target** (no PsExec). The task is created over the same DCOM/WMI connection used for update checks, reports per-update progress through `HKLM\SOFTWARE\WUU2\Jobs`, and is removed when it finishes. Requires Windows 8 / Server 2012 or later on the target (Task Scheduler WMI provider); Windows 7 targets are not supported for download/install.
 - **Debug logging ships enabled** (`$script:EnableDebugLogging = $true`) to aid diagnosis — it writes large log files and costs performance. Flip it to `$false` at the top of `WUU.ps1` for production use.
 - **Heavier failure paths** — retry logic with 5-second backoffs and bounded timeouts means a genuinely unreachable host takes longer to report than the original's fast fail (in exchange for never hanging).
 - **The update search must run in-process** — WUA COM objects can't be serialized across a `Start-Job` boundary (deserialized update collections can't be downloaded/installed), so search concurrency is bounded by design.
@@ -48,9 +48,7 @@ The original WUU (Tyler Siegrist, 2016) is a WPF script whose remote checks can 
 - Windows PowerShell 5.1 (recommended for best WPF compatibility). PowerShell 7+ may work but WPF/AD features can be more limited depending on system components.
 - Run as Administrator (required for full functionality).
 - PowerShell must run in STA mode (required for WPF): `powershell.exe -STA`.
-- PsExec must be available in the repo folder as `psexec.exe`.
-	- Download: https://docs.microsoft.com/en-us/sysinternals/downloads/psexec
-	- If missing, the script can prompt to download PsTools automatically.
+- Target computers: admin rights for the account running WUU (or the configured custom credentials), and WMI/DCOM reachable through the firewall. No PsExec, SMB admin share, or WinRM listener is needed for check/download/install.
 
 ## Run
 

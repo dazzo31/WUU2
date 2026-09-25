@@ -56,7 +56,44 @@ function Invoke-CimWithTimeout {
         if ($cimResult.Success) {
             return @{ Success = $true; Result = $cimResult.Result }
         } else {
-            return @{ Success = $false; Error = $cimResult.Error }
+            # Recovery hook for RPC-class errors (0x800706ba, 0x800706be)
+            $errorMsg = $cimResult.Error
+            $hresult = $null
+            if ($errorMsg -match '0x([0-9A-Fa-f]{8})') {
+                try { $hresult = [Convert]::ToInt32($matches[1], 16) } catch { }
+            }
+            if ($hresult -eq 0x800706ba -or $hresult -eq 0x800706be) {
+                try {
+                    $recoverySucceeded = Invoke-AutoRecovery -ComputerName $ComputerName -ErrorCode $errorMsg -ErrorAction SilentlyContinue
+                    if ($recoverySucceeded) {
+                        Start-Sleep -Seconds 2   # brief pause before retry
+                        # Retry once after recovery
+                        $retryResult = Invoke-WithPoolTimeout -ScriptBlock {
+                            param([string]$ComputerName, [string]$ClassName, [pscredential]$Cred)
+                            $cimSession = $null
+                            try {
+                                $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol DCOM) }
+                                if ($Cred) { $sessionArgs['Credential'] = $Cred }
+                                $cimSession = New-CimSession @sessionArgs -ErrorAction Stop
+                                $result = Get-CimInstance -CimSession $cimSession -ClassName $ClassName -ErrorAction Stop
+                                return @{ Success = $true; Result = $result }
+                            } catch {
+                                return @{ Success = $false; Error = $_.Exception.Message }
+                            } finally {
+                                if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
+                            }
+                        } -ArgumentList @($ComputerName, $ClassName, $Credential) -TimeoutSeconds $TimeoutSeconds -OperationName "$Operation (post-recovery retry)"
+
+                        if ($retryResult.Success) {
+                            return @{ Success = $true; Result = $retryResult.Result; RecoveredAfterRpcError = $true }
+                        }
+                        # Fall through to failure if retry also failed
+                    }
+                } catch {
+                    # Recovery itself failed - fall through to original error
+                }
+            }
+            return @{ Success = $false; Error = $errorMsg }
         }
     } catch {
         return @{ Success = $false; Error = $_.Exception.Message }
@@ -270,5 +307,111 @@ function Invoke-WithTimeout {
     }
 }
 
-Export-ModuleMember -Function @('Invoke-CimWithTimeout', 'Invoke-ServiceWithTimeout', 'Test-SystemDependencies', 'Invoke-WithTimeout')
+function Invoke-WuuRemoteTask {
+    <#
+    .SYNOPSIS
+    Runs a script on a remote computer as SYSTEM via a one-off scheduled task over a DCOM CIM session.
+    WUA download/install refuse remote callers, so the work must run on the target.
+    The script reports progress/result as JSON in HKLM\SOFTWARE\WUU2\Jobs\<RunId>\State (read via StdRegProv).
+    Injected into worker runspaces as text - built-in cmdlets only.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ComputerName,
+        [Parameter(Mandatory)][string]$ScriptPath,
+        [Parameter(Mandatory)][string]$Operation,
+        [pscredential]$Credential = $null,
+        [scriptblock]$ProgressCallback = $null,
+        [int]$TimeoutMinutes = 240,
+        [int]$PollSeconds = 5
+    )
+
+    $runId = [guid]::NewGuid().ToString('N')
+    $taskPath = '\WUU2\'
+    $taskName = "WUU2_${Operation}_$runId"
+    $jobsKey = 'SOFTWARE\WUU2\Jobs'
+    $hklm = [uint32]2147483650
+    $cim = $null
+    $registered = $false
+
+    $readState = {
+        param([string]$Id)
+        try {
+            $r = Invoke-CimMethod -CimSession $cim -Namespace 'root/default' -ClassName 'StdRegProv' -MethodName 'GetStringValue' `
+                -Arguments @{ hDefKey = $hklm; sSubKeyName = "$jobsKey\$Id"; sValueName = 'State' } -ErrorAction Stop
+            if ($r.ReturnValue -eq 0 -and $r.sValue) { return ($r.sValue | ConvertFrom-Json) }
+        } catch { }
+        return $null
+    }
+    $removeState = {
+        param([string]$Id)
+        try {
+            [void](Invoke-CimMethod -CimSession $cim -Namespace 'root/default' -ClassName 'StdRegProv' -MethodName 'DeleteKey' `
+                -Arguments @{ hDefKey = $hklm; sSubKeyName = "$jobsKey\$Id" } -ErrorAction Stop)
+        } catch { }
+    }
+
+    try {
+        $sessionArgs = @{ ComputerName = $ComputerName; SessionOption = (New-CimSessionOption -Protocol Dcom); OperationTimeoutSec = 60 }
+        if ($Credential) { $sessionArgs['Credential'] = $Credential }
+        $cim = New-CimSession @sessionArgs -ErrorAction Stop
+
+        # Remove leftovers from runs whose controller died (e.g. GUI closed mid-install)
+        $orphanCutoff = (Get-Date).AddMinutes(-($TimeoutMinutes + 30))
+        foreach ($old in @(Get-ScheduledTask -CimSession $cim -TaskPath $taskPath -ErrorAction SilentlyContinue)) {
+            if ($old.State -eq 'Running') { continue }
+            $oldInfo = Get-ScheduledTaskInfo -CimSession $cim -TaskName $old.TaskName -TaskPath $taskPath -ErrorAction SilentlyContinue
+            if (-not $oldInfo -or -not $oldInfo.LastRunTime -or $oldInfo.LastRunTime -gt $orphanCutoff) { continue }
+            Unregister-ScheduledTask -CimSession $cim -TaskName $old.TaskName -TaskPath $taskPath -Confirm:$false -ErrorAction SilentlyContinue
+            & $removeState ($old.TaskName -replace '^.*_', '')
+        }
+
+        $scriptText = "`$RunId = '$runId'`r`n" + (Get-Content -Path $ScriptPath -Raw -ErrorAction Stop)
+        $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($scriptText))
+        $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded"
+        $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes $TimeoutMinutes)
+
+        Register-ScheduledTask -CimSession $cim -TaskName $taskName -TaskPath $taskPath -Action $action -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+        $registered = $true
+        Start-ScheduledTask -CimSession $cim -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop
+        $startedAt = Get-Date
+        $deadline = $startedAt.AddMinutes($TimeoutMinutes + 5)
+
+        while ($true) {
+            Start-Sleep -Seconds $PollSeconds
+            $state = & $readState $runId
+            if ($state -and $ProgressCallback) { try { $null = & $ProgressCallback $state } catch { } }
+
+            $task = Get-ScheduledTask -CimSession $cim -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop
+            if ((Get-Date) -gt $deadline) {
+                throw "Remote $Operation task on $ComputerName timed out after $TimeoutMinutes minutes"
+            }
+            if ($task.State -eq 'Running' -or $task.State -eq 'Queued') { continue }
+
+            # 0x41303 = task has not run yet; allow the scheduler a minute to pick it up
+            $info = Get-ScheduledTaskInfo -CimSession $cim -TaskName $taskName -TaskPath $taskPath -ErrorAction Stop
+            if ($info.LastTaskResult -eq 0x41303 -and ((Get-Date) - $startedAt).TotalSeconds -lt 60) { continue }
+            break
+        }
+
+        $state = & $readState $runId
+        $exitCode = [int64]$info.LastTaskResult
+        if ($state -and $state.Result -eq 'Success') {
+            return @{ Success = $true; Count = [int]$state.Count; Total = [int]$state.Total; RebootRequired = [bool]$state.RebootRequired; ExitCode = $exitCode; Error = $null }
+        }
+        $errorText = if ($state -and $state.ErrorMessage) { $state.ErrorMessage } else { "Remote $Operation task ended without a result (task result 0x{0:X})" -f $exitCode }
+        return @{ Success = $false; Count = 0; Total = 0; RebootRequired = $false; ExitCode = $exitCode; Error = $errorText }
+    } finally {
+        if ($cim) {
+            if ($registered) {
+                Unregister-ScheduledTask -CimSession $cim -TaskName $taskName -TaskPath $taskPath -Confirm:$false -ErrorAction SilentlyContinue
+            }
+            & $removeState $runId
+            Remove-CimSession -CimSession $cim -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+Export-ModuleMember -Function @('Invoke-CimWithTimeout', 'Invoke-ServiceWithTimeout', 'Test-SystemDependencies', 'Invoke-WithTimeout', 'Invoke-WuuRemoteTask')
 

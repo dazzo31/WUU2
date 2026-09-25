@@ -45,7 +45,7 @@ $global:LogPath = Join-Path $env:TEMP 'WUU_test_pendingdrain.log'
 $global:updatesHash = [hashtable]::Synchronized(@{})
 $global:performanceHash = [hashtable]::Synchronized(@{})
 $global:errorSuggestionsHash = New-WuuErrorSuggestions
-$global:ConfigPaths = @{ PsExec = 'unused'; DownloadScript='unused'; InstallScript='unused' }
+$global:ConfigPaths = @{ DownloadScript='unused'; InstallScript='unused' }
 $global:UseCustomCredentials = $false
 $global:CustomCredentials = $null
 $global:CredentialCache = @{}

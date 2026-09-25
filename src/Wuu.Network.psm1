@@ -41,50 +41,85 @@ function Invoke-RemoteComWithTimeout {
 function Get-SystemPerformance {
     param([string]$ComputerName)
     try {
-        # Skip credential handling for local computer
-        if ($ComputerName -eq 'localhost' -or $ComputerName -eq $env:COMPUTERNAME) {
-            $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | 
-                   Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
-            
-            $memory = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
-            $memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024, 2)
-        } else {
-            # Get appropriate credentials for remote computer
-            $credential = Get-RemoteCredentials -ComputerName $ComputerName -Operation 'performance monitoring'
-            
-            if ($credential) {
-                # Use alternate credentials
-                $cimSessionOptions = New-CimSessionOption -Protocol DCOM
-                $cimSession = New-CimSession -ComputerName $ComputerName -SessionOption $cimSessionOptions -Credential $credential -ErrorAction Stop
-                
-                $cpu = Get-CimInstance -CimSession $cimSession -ClassName Win32_Processor -ErrorAction Stop | 
-                       Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
-                
-                $memory = Get-CimInstance -CimSession $cimSession -ClassName Win32_OperatingSystem -ErrorAction Stop
-                $memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024, 2)
-                
-                Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue
-            } else {
-                # Use domain credentials
-                $cimSessionOptions = New-CimSessionOption -Protocol DCOM
-                $cimSession = New-CimSession -ComputerName $ComputerName -SessionOption $cimSessionOptions -ErrorAction Stop
-                
-                $cpu = Get-CimInstance -CimSession $cimSession -ClassName Win32_Processor -ErrorAction Stop | 
-                       Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
-                
-                $memory = Get-CimInstance -CimSession $cimSession -ClassName Win32_OperatingSystem -ErrorAction Stop
-                $memoryUsed = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024, 2)
-                
-                Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue
+        # Use pool-bounded CIM queries to avoid unbounded hangs on unresponsive hosts.
+        # $global:PerformanceTimeoutSeconds is set by Wuu.Core config (default 60).
+        $timeoutSec = if ($global:PerformanceTimeoutSeconds) { $global:PerformanceTimeoutSeconds } else { 60 }
+
+        $perfScript = {
+            param($TargetComputer)
+            $result = @{
+                CPUPercent = 0
+                MemoryUsedMB = 0
+                Success = $false
+                Error = $null
+            }
+            try {
+                if ($TargetComputer -eq 'localhost' -or $TargetComputer -eq $env:COMPUTERNAME) {
+                    $cpu = Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop |
+                           Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+                    $memory = Get-CimInstance -ClassName Win32_OperatingSystem -ErrorAction Stop
+                    $result.CPUPercent = $cpu
+                    $result.MemoryUsedMB = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024, 2)
+                    $result.Success = $true
+                } else {
+                    # Get credentials inside the pool so the runspace inherits them
+                    $credential = Get-RemoteCredentials -ComputerName $TargetComputer -Operation 'performance monitoring'
+                    $sessionOpts = New-CimSessionOption -Protocol DCOM
+                    $cimSession = $null
+                    try {
+                        if ($credential) {
+                            $cimSession = New-CimSession -ComputerName $TargetComputer -SessionOption $sessionOpts -Credential $credential -ErrorAction Stop
+                        } else {
+                            $cimSession = New-CimSession -ComputerName $TargetComputer -SessionOption $sessionOpts -ErrorAction Stop
+                        }
+
+                        $cpu = Get-CimInstance -CimSession $cimSession -ClassName Win32_Processor -ErrorAction Stop |
+                               Measure-Object -Property LoadPercentage -Average | Select-Object -ExpandProperty Average
+                        $memory = Get-CimInstance -CimSession $cimSession -ClassName Win32_OperatingSystem -ErrorAction Stop
+                        $result.CPUPercent = $cpu
+                        $result.MemoryUsedMB = [math]::Round(($memory.TotalVisibleMemorySize - $memory.FreePhysicalMemory) / 1024, 2)
+                        $result.Success = $true
+                    } finally {
+                        if ($cimSession) { Remove-CimSession -CimSession $cimSession -ErrorAction SilentlyContinue }
+                    }
+                }
+            } catch {
+                $result.Error = $_.Exception.Message
+            }
+            return $result
+        }
+
+        $invocation = Invoke-WithPoolTimeout -ScriptBlock $perfScript -ArgumentList $ComputerName -TimeoutSeconds $timeoutSec -OperationName "Perf query $ComputerName"
+
+        if (-not $invocation.Success) {
+            return @{
+                CPUPercent = 0
+                MemoryUsedMB = 0
+                NetworkLatencyMs = 9999
+                Status = if ($invocation.Error -match 'timed out') {
+                    "Timeout: Performance query exceeded ${timeoutSec}s on $ComputerName"
+                } else {
+                    "Error: $($invocation.Error)"
+                }
             }
         }
-        
+
+        $perfResult = $invocation.Result
+        if (-not $perfResult.Success) {
+            return @{
+                CPUPercent = 0
+                MemoryUsedMB = 0
+                NetworkLatencyMs = 9999
+                Status = "Error: $($perfResult.Error)"
+            }
+        }
+
         $ping = Test-Connection -ComputerName $ComputerName -Count 1 -ErrorAction Stop
         $latency = $ping.ResponseTime
-        
+
         return @{
-            CPUPercent = $cpu
-            MemoryUsedMB = $memoryUsed
+            CPUPercent = $perfResult.CPUPercent
+            MemoryUsedMB = $perfResult.MemoryUsedMB
             NetworkLatencyMs = $latency
             Status = 'Success'
         }

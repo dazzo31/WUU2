@@ -8,7 +8,7 @@ GUI tool (Windows Update Utility) for checking/downloading/installing Windows Up
 
 ## Runtime constraints
 - Target Windows PowerShell 5.1, elevated, STA mode (`powershell.exe -STA`); the script self-checks `$host.Runspace.ApartmentState`. Preserve PowerShell 7 compatibility patterns already in place: `Get-CimInstance` instead of `Get-WmiObject`, `Invoke-Command` instead of `-ComputerName` remoting parameters.
-- Remote download/install runs via `psexec.exe` (expected in repo root) because Windows Update COM APIs can't be driven remotely.
+- Remote download/install runs `Scripts\Download-Patches.ps1` / `Install-Patches.ps1` on the target as a temporary SYSTEM scheduled task via `Invoke-WuuRemoteTask` (src/Wuu.Remote.psm1, DCOM CIM session; progress via `HKLM\SOFTWARE\WUU2\Jobs`), because Windows Update COM APIs refuse remote download/install. No PsExec. Worker runspaces get it as the injected `$InvokeRemoteTaskScript`.
 
 ## Concurrency conventions (critical)
 - UI state is shared through the synchronized hashtable `$uiHash`; background work uses runspaces plus the synchronized `$jobs` ArrayList, throttled by `$MaxConcurrentJobs`.

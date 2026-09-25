@@ -1,24 +1,48 @@
-﻿$updateSession = New-Object -ComObject 'Microsoft.Update.Session'
-$updateSearcher = $updateSession.CreateupdateSearcher()
-$searchResult = $updateSearcher.Search("IsInstalled=0 and IsHidden=0")
-
-if($searchResult.updates.count -eq 0){return 0}
-
-$updatesToInstall = New-Object -ComObject "Microsoft.Update.UpdateColl"
-
-ForEach($update in $searchResult.Updates){
-    if($update.InstallationBehavior.CanRequestUserInput -eq $true){continue}
-    if($update.IsDownloaded -eq $false){continue}
-    if($update.EulaAccepted -eq $false){$update.AcceptEula()}
-    $updatesToInstall.Add($update) | Out-Null
+﻿# Runs on the target as SYSTEM via a WUU2 scheduled task; $RunId is prepended by Invoke-WuuRemoteTask.
+if (-not $RunId) { $RunId = 'manual' }
+$regPath = "HKLM:\SOFTWARE\WUU2\Jobs\$RunId"
+function Write-WuuProgress([hashtable]$Data) {
+    try {
+        if (-not (Test-Path $regPath)) { New-Item -Path $regPath -Force | Out-Null }
+        Set-ItemProperty -Path $regPath -Name 'State' -Value ($Data | ConvertTo-Json -Compress)
+    } catch { }
 }
 
-$installer = $updateSession.CreateUpdateInstaller()
-$installer.Updates = $updatesToInstall
-$installationResult = $installer.Install()
+try {
+    Write-WuuProgress @{ Phase = 'Searching' }
+    $updateSession = New-Object -ComObject 'Microsoft.Update.Session'
+    $searchResult = $updateSession.CreateUpdateSearcher().Search("IsInstalled=0 and IsHidden=0")
 
-$numErrors = 0
-0..($updatesToInstall.Count - 1) | % {
-    if($installationResult.GetUpdateResult($_).ResultCode -ge 4){$numErrors++}
+    $toInstall = @(foreach ($update in $searchResult.Updates) {
+        if ($update.InstallationBehavior.CanRequestUserInput) { continue }
+        if (-not $update.IsDownloaded) { continue }
+        if (-not $update.EulaAccepted) { $update.AcceptEula() }
+        $update
+    })
+
+    # One update per Install() call so progress can be reported between updates
+    $numErrors = 0
+    $rebootRequired = $false
+    $i = 0
+    foreach ($update in $toInstall) {
+        $i++
+        Write-WuuProgress @{ Phase = 'Installing'; Current = $i; Total = $toInstall.Count; Title = $update.Title }
+        $coll = New-Object -ComObject 'Microsoft.Update.UpdateColl'
+        [void]$coll.Add($update)
+        $installer = $updateSession.CreateUpdateInstaller()
+        $installer.Updates = $coll
+        $installResult = $installer.Install()
+        if ($installResult.GetUpdateResult(0).ResultCode -ge 4) { $numErrors++ }
+        if ($installResult.RebootRequired) { $rebootRequired = $true }
+    }
+
+    try {
+        if ((New-Object -ComObject 'Microsoft.Update.SystemInfo').RebootRequired) { $rebootRequired = $true }
+    } catch { }
+
+    Write-WuuProgress @{ Phase = 'Done'; Result = 'Success'; Count = $numErrors; Total = $toInstall.Count; RebootRequired = $rebootRequired }
+    exit $numErrors
+} catch {
+    Write-WuuProgress @{ Phase = 'Done'; Result = 'Error'; ErrorMessage = $_.Exception.Message }
+    exit 9999
 }
-return $numErrors

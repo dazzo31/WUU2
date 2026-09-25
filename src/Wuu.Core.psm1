@@ -38,7 +38,7 @@ Date: 12/14/2016
 
 This script needs to be run as an administrator with the credentials of an administrator on the remote computers.
 
-There is limited feedback on the download and install processes due to Microsoft restricting the ability to remotely download or install Windows Updates. This is done by using psexec to run a script locally on the remote machine.
+Microsoft restricts remote download/install of Windows Updates, so those steps run the patch scripts locally on the remote machine as SYSTEM through a temporary scheduled task (managed over WMI/DCOM), which reports progress back through the registry.
 
 .CHANGELOG
 Enhanced Version - 2025-07-08
@@ -87,6 +87,16 @@ $global:sessionTimeout = 30       # Timeout for creating Windows Update session
 $global:searchTimeout = 300       # Timeout for update search operation
 $global:rebootCheckTimeout = 60   # Timeout for reboot check
 
+# Timeout settings for remote probes and bounded operations (seconds).
+# Centralised so remote probes no longer depend on hardcoded literals.
+$global:CimTimeoutSeconds         = 10   # was hardcoded 5 in Remote/Credentials probes
+$global:ServiceTimeoutSeconds     = 10   # was hardcoded 5
+$global:PerformanceTimeoutSeconds = 60   # was unbounded raw CIM in Get-SystemPerformance
+$global:CredProbeTimeoutSeconds   = 10   # was hardcoded 5 in WindowsUpdate runspace
+$global:RebootProbeTimeoutSeconds = 10   # online probe inside reboot wait
+$global:OfflineWaitSeconds        = 600  # was hardcoded inline in $RestartComputer
+$global:OnlineWaitSeconds         = 1800 # was hardcoded inline in $RestartComputer
+
 # Enhanced error handling toggle. Set to $true to enable advanced error handling.
 $global:EnableEnhancedErrorHandling = $true
 
@@ -106,7 +116,6 @@ $global:backgroundProcessing = [hashtable]::Synchronized(@{ Suspended = $false }
 
 # File paths and external tool configuration
 $global:ConfigPaths = @{
-    PsExec = Join-Path $WuuRoot 'psexec.exe'
     DownloadScript = Join-Path $WuuRoot 'Scripts\Download-Patches.ps1'
     InstallScript = Join-Path $WuuRoot 'Scripts\Install-Patches.ps1'
     ComputerListConfig = Join-Path $WuuRoot 'ComputerList.config'
@@ -114,7 +123,7 @@ $global:ConfigPaths = @{
 }
 
 # Validation of required external files
-$requiredFiles = @('psexec.exe', 'Scripts\Download-Patches.ps1', 'Scripts\Install-Patches.ps1')
+$requiredFiles = @('Scripts\Download-Patches.ps1', 'Scripts\Install-Patches.ps1')
 foreach ($file in $requiredFiles) {
     $fullPath = Join-Path $WuuRoot $file
     if (-not (Test-Path $fullPath)) {
@@ -263,67 +272,12 @@ try {
 #endregion Administrator Privilege Check
 
 #region Working Directory Setup
-    #Ensure that we are running the GUI from the correct location so that scripts & psexec can be accessed.
+    #Ensure that we are running the GUI from the correct location so that Scripts\ can be accessed.
     $scriptPath = $WuuRoot
     Set-Location $scriptPath
     Write-DebugLog "Working directory set to: $(Get-Location)" -Level 'INFO'
 
 #endregion Working Directory Setup
-
-#region PsExec Validation
-    #Check for PsExec
-    $psexecPath = Join-Path $scriptPath "psexec.exe"
-    If (-Not (Test-Path $psexecPath)){
-        Write-Warning "Psexec.exe missing from $scriptPath!"
-        Write-Host "You can download PsTools directly. Would you like to proceed? (Y/N)" -ForegroundColor Yellow
-        $response = Read-Host
-        if ($response -eq 'Y' -or $response -eq 'y') {
-            try {
-                $psToolsUrl = 'https://download.sysinternals.com/files/PSTools.zip'
-                $zipPath = Join-Path $scriptPath "PSTools.zip"
-                $psToolsExtractedPath = Join-Path $scriptPath "PSTools"
-                
-                Write-Host "Downloading PsTools from $psToolsUrl..." -ForegroundColor Yellow
-                Write-Host "This may take a moment depending on your internet connection..." -ForegroundColor Cyan
-                
-                # Download with progress (if supported)
-                try {
-                    $webClient = New-Object System.Net.WebClient
-                    $webClient.DownloadFile($psToolsUrl, $zipPath)
-                    $webClient.Dispose()
-                } catch {
-                    # Fallback to Invoke-WebRequest
-                    Invoke-WebRequest -Uri $psToolsUrl -OutFile $zipPath -ErrorAction Stop
-                }
-                
-                Write-Host "Extracting PsTools..." -ForegroundColor Yellow
-                Expand-Archive -Path $zipPath -DestinationPath $psToolsExtractedPath -Force -ErrorAction Stop
-                
-                Write-Host "Copying psexec.exe to script directory..." -ForegroundColor Yellow
-                Copy-Item -Path (Join-Path $psToolsExtractedPath 'psexec.exe') -Destination $scriptPath -Force -ErrorAction Stop
-                
-                # Cleanup
-                Remove-Item $zipPath -Force
-                Remove-Item $psToolsExtractedPath -Recurse -Force
-                
-                Write-Host "PsExec downloaded and placed in the script directory." -ForegroundColor Green
-            } catch {
-                Write-Error "Failed to download or extract PsTools: $($_.Exception.Message)"
-                Write-Host "Please download psexec.exe manually and place it in the script directory." -ForegroundColor Cyan
-                Write-Host "Download URL: https://docs.microsoft.com/en-us/sysinternals/downloads/psexec" -ForegroundColor Cyan
-                Read-Host "Press Enter to exit"
-                exit
-            }
-        } else {
-            Write-Host "Please download psexec.exe manually and place it in the script directory." -ForegroundColor Cyan
-            Write-Host "Download URL: https://docs.microsoft.com/en-us/sysinternals/downloads/psexec" -ForegroundColor Cyan
-            Read-Host "Press Enter to exit"
-            exit
-        }
-    }
-    Write-DebugLog "psexec.exe found at: $psexecPath" -Level 'INFO'
-
-#endregion PsExec Validation
 
 #region PowerShell STA Mode Validation
     #Determine if this instance of PowerShell can run WPF (required for GUI)
@@ -343,7 +297,107 @@ try {
     Write-DebugLog "PowerShell is running in STA mode" -Level 'INFO'
 
 #endregion PowerShell STA Mode Validation
-    
+
+#region State Machine Helpers
+
+function Set-ComputerState {
+    <#
+    .SYNOPSIS
+    Updates a computer's State and Status consistently. The State column in the
+    ListView is the canonical pipeline position; Status is the human-readable text.
+    Callers should prefer Set-ComputerState over direct `$Computer.Status = '...'`
+    assignments so the two never drift.
+    .PARAMETER Computer - ListView row object (the per-computer PSCustomObject)
+    .PARAMETER State - One of the canonical pipeline states
+    .PARAMETER StatusDetail - Optional suffix appended to the canned status text
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Computer,
+        [Parameter(Mandatory)][ValidateSet('Queued','Connecting','Connected','Checking','Searching','UpdatesFound','Downloading','Installing','RebootRequired','Rebooting','Verifying','Complete','Timeout','Error')][string]$State,
+        [Parameter(Mandatory=$false)][string]$StatusDetail = ''
+    )
+
+    $stateToStatus = @{
+        'Queued'          = 'Waiting to start...'
+        'Connecting'      = 'Testing Connectivity.'
+        'Connected'       = 'Online.'
+        'Checking'        = 'Initializing update session...'
+        'Searching'       = 'Checking for updates...'
+        'UpdatesFound'    = 'Updates found.'
+        'Downloading'     = 'Downloading updates...'
+        'Installing'      = 'Installing updates...'
+        'RebootRequired'  = 'Reboot required.'
+        'Rebooting'       = 'Restarting...'
+        'Verifying'       = 'Verifying post-reboot state...'
+        'Complete'        = 'All updates installed.'
+        'Timeout'         = 'Operation timed out (recoverable).'
+        'Error'           = 'Error occurred.'
+    }
+
+    $statusString = $stateToStatus[$State]
+    if ($StatusDetail) {
+        $statusString += " $StatusDetail"
+    }
+
+    try {
+        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
+            $uiHash.Listview.Items.EditItem($Computer)
+            $Computer.State = $State
+            $Computer.Status = $statusString
+            $uiHash.Listview.Items.CommitEdit()
+        })
+    } catch {
+        Write-DebugLog "Set-ComputerState dispatcher failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+    }
+
+    Write-DebugLog "[$($Computer.Computer)] State -> $State : $statusString" -Level 'DEBUG'
+}
+
+function Set-ComputerTimeout {
+    <#
+    .SYNOPSIS
+    Marks a computer's operation as timed out WITHOUT marking it as a terminal
+    error. Timeout is recoverable (the next phase or a Phase-E retry may still
+    complete); Error is terminal. UI treats them differently (Timeout = yellow,
+    Error = grey) via the row Background callsites.
+    .PARAMETER Computer - ListView row object
+    .PARAMETER Phase - What timed out ('WUA Session','Update Search','Reboot Wait',
+                       'Performance Query','Credential Probe', etc.)
+    .PARAMETER TimeoutSec - The timeout that was exceeded
+    .PARAMETER Detail - Optional context appended to the status string
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Computer,
+        [Parameter(Mandatory)][string]$Phase,
+        [Parameter(Mandatory)][int]$TimeoutSec,
+        [Parameter(Mandatory=$false)][string]$Detail = ''
+    )
+
+    try {
+        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
+            $uiHash.Listview.Items.EditItem($Computer)
+            $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
+            $Computer.TimeoutSource    = $Phase
+            $Computer.UpdatesStatus    = 'Timeout'
+            $Computer.State            = 'Timeout'
+            $detailSuffix = if ($Detail) { " $Detail" } else { '' }
+            $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
+            # Timeout is recoverable - yellow, not the terminal-error grey
+            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
+            if ($listViewItem) {
+                $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow
+            }
+            $uiHash.Listview.Items.CommitEdit()
+        })
+    } catch {
+        Write-DebugLog "Set-ComputerTimeout dispatcher failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+    }
+
+    Write-DebugLog "[$($Computer.Computer)] TIMEOUT in $Phase after ${TimeoutSec}s. $Detail" -Level 'WARN'
+}
+
+#endregion State Machine Helpers
+
 } catch {
     Write-Error "Environment validation failed: $($_.Exception.Message)"
     Write-DebugLog "Error details: $($_.Exception.GetType().FullName)" -Level 'ERROR'
@@ -788,6 +842,9 @@ $AddEntry = {
                     
                     Write-InfoLog "Creating PSObject for computer: $computer"
                     $computerObject = New-Object PSObject -Property @{
+                        State = 'Queued'
+                        StateTimestamp = Get-Date
+                        StateSource = 'Add-Computer-Direct'
                         Computer = $computer
                         Phase = "Phase 1"
                         Available = 0 -as [int]
@@ -798,6 +855,10 @@ $AddEntry = {
                         UpdatesStatus = "Initializing"
                         Runspace = $null
                         Pending = $true
+                        TimeoutExpiresAt = $null
+                        TimeoutSource = ''
+                        RetryCount = 0
+                        RetryAt = $null
                     }
                     Write-InfoLog "PSObject created successfully for computer: $computer"
                     
@@ -838,6 +899,9 @@ $AddEntry = {
                     
                     Write-InfoLog "Creating PSObject for computer: $computer"
                     $computerObject = New-Object PSObject -Property @{
+                        State = 'Queued'
+                        StateTimestamp = Get-Date
+                        StateSource = 'Add-Computer-Dispatched'
                         Computer = $computer
                         Phase = "Phase 1"
                         Available = 0 -as [int]
@@ -848,6 +912,10 @@ $AddEntry = {
                         UpdatesStatus = "Initializing"
                         Runspace = $null
                         Pending = $true
+                        TimeoutExpiresAt = $null
+                        TimeoutSource = ''
+                        RetryCount = 0
+                        RetryAt = $null
                     }
                     Write-InfoLog "PSObject created successfully for computer: $computer"
                     
@@ -1120,7 +1188,6 @@ $ClearComputerList = {
 $DownloadUpdates = {
     Param ($Computer)
     Try{
-        #Set path for psexec, scripts
         Set-Location $path
 
         #Check download size
@@ -1130,22 +1197,37 @@ $DownloadUpdates = {
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Downloading $($dlStats.Count) Updates ($([math]::Round($dlStats.Sum/1MB))MB)."
+            $computer.State = 'Downloading'
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
 
-        #Copy script to remote computer and execute using centralized paths
-        Copy-Item $ConfigPaths.DownloadScript "\\$($Computer.computer)\c$" -Force
-        [int]$numDownloaded = & $ConfigPaths.PsExec -accepteula -nobanner -s "\\$($Computer.computer)" cmd.exe /c 'echo . | powershell.exe -ExecutionPolicy Bypass -file C:\Download-Patches.ps1'
-        Remove-Item "\\$($Computer.computer)\c$\Download-Patches.ps1"
-        if($LASTEXITCODE -ne 0){
-            throw "PsExec failed with error code $LASTEXITCODE"
+        $remoteCred = $null
+        if ($UseCustomCredentials -and $Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
+            try { $remoteCred = & $GetRemoteCredentialsScript -ComputerName $Computer.computer -Operation 'Windows Update download' } catch { $remoteCred = $null }
         }
+        $onProgress = {
+            param($p)
+            if ($p.Phase -ne 'Downloading') { return }
+            $progressText = "Downloading $($p.Current)/$($p.Total): $($p.Title)"
+            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                $uiHash.Listview.Items.EditItem($Computer)
+                $Computer.Status = $progressText
+                $uiHash.Listview.Items.CommitEdit()
+                $uiHash.Listview.Items.Refresh()
+            })
+        }
+        $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.DownloadScript -Operation 'Download' -Credential $remoteCred -ProgressCallback $onProgress
+        if (-not $taskResult.Success) {
+            throw "Remote download failed: $($taskResult.Error)"
+        }
+        $numDownloaded = $taskResult.Count
 
         #Update status
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Download complete.'
+            $computer.State = 'UpdatesFound'
             $computer.Downloaded += $numDownloaded
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
@@ -1161,6 +1243,7 @@ $DownloadUpdates = {
                 $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                     $uiHash.Listview.Items.EditItem($Computer)
                     $computer.Status = 'Auto-installing downloaded updates...'
+                    $computer.State = 'Installing'
                     $uiHash.Listview.Items.CommitEdit()
                     $uiHash.Listview.Items.Refresh()
                 })
@@ -1188,6 +1271,7 @@ $DownloadUpdates = {
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Error occured: $($_.Exception.Message)."
             $computer.UpdatesStatus = 'Error'
+            $computer.State = 'Error'
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
             if($listViewItem) {
@@ -1427,6 +1511,7 @@ $GetUpdates = {
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Validating connectivity and services...'
+            $computer.State = 'Connecting'
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
@@ -1671,6 +1756,7 @@ $GetUpdates = {
                 $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                     $uiHash.Listview.Items.EditItem($Computer)
                     $computer.Status = "Creating Windows Update session (attempt $retryCount/$maxRetries)..."
+                    $computer.State = 'Checking'
                     $uiHash.Listview.Items.CommitEdit()
                     $uiHash.Listview.Items.Refresh()
                 })
@@ -1696,7 +1782,7 @@ $GetUpdates = {
                                 $logEntry = "[$timestamp] [WARN] [$($Computer.Computer)] Direct COM creation failed, this is expected for cross-domain scenarios: $($_.Exception.Message)"
                                 & $WriteLogFileScript $logEntry
                             }
-                            throw "Remote COM object creation failed. This often occurs in cross-domain scenarios. Consider using PsExec for cross-domain Windows Update management."
+                            throw "Remote COM object creation failed. This often occurs in cross-domain scenarios. Configure custom credentials for the target domain and verify DCOM/WMI access."
                         }
                     }
                     $sessionCreated = $true
@@ -1765,6 +1851,7 @@ $GetUpdates = {
         # If we get here, connection was successful
         SafeUpdateListViewItem $Computer.computer @{
             Status = 'Checking for updates, this may take some time.'
+            State  = 'Searching'
         }
 
         #Check for updates with timeout handling.
@@ -1881,19 +1968,24 @@ $GetUpdates = {
                 $computer.Available = $adjustedAvailableCount
                 $computer.Downloaded = $dlCount
                 $computer.RebootRequired = $rebootRequired
+                $computer.RetryCount = 0
+                $computer.RetryAt = $null
                 
                 # Set UpdatesStatus for color scheme and update Status column
                 if ($adjustedAvailableCount -gt 0) {
                     $computer.UpdatesStatus = 'Updates required'
                     $computer.Status = "$($adjustedAvailableCount) update(s) found. Right-click > Download Updates."
+                    $computer.State = 'UpdatesFound'
                 } else {
                     # Check if reboot is required based on our simplified logic
                     if ($rebootRequired) {
                         $computer.UpdatesStatus = 'Reboot required'
                         $computer.Status = 'Up-to-date. Reboot required to complete previous installations.'
+                        $computer.State = 'RebootRequired'
                     } else {
                         $computer.UpdatesStatus = 'All updates installed'
                         $computer.Status = 'Up-to-date. No updates available.'
+                        $computer.State = 'Complete'
                     }
                 }
                 
@@ -1951,6 +2043,7 @@ $GetUpdates = {
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
                 $computer.Status = 'Auto-downloading available updates...'
+                $computer.State = 'Downloading'
                 $uiHash.Listview.Items.CommitEdit()
                 $uiHash.Listview.Items.Refresh()
             })
@@ -1991,18 +2084,63 @@ $GetUpdates = {
             $_.Exception.Message
         }
         
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Error occurred: $errorMessage"
-            $computer.UpdatesStatus = 'Error'
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+        # Timeout classification: timeouts are RECOVERABLE, not terminal errors.
+        # We use Set-ComputerTimeout so the row shows 'Timeout' (yellow), NOT 'Error' (grey).
+        # This lets Phase-E retry logic pick them up later.
+        if ($errorMessage -match 'timed out|timeout|exceeded.*seconds|exceeded.*minutes') {
+            # Determine which phase timed out based on message text
+            $timeoutPhase = 'Update Operation'
+            if ($errorMessage -match 'session.*creation|Windows Update session') { $timeoutPhase = 'WUA Session' }
+            elseif ($errorMessage -match 'Update search|search timed out') { $timeoutPhase = 'Update Search' }
+            elseif ($errorMessage -match 'Reboot.*online|did not come online') { $timeoutPhase = 'Reboot Online Wait' }
+            elseif ($errorMessage -match 'Reboot.*offline|did not go offline') { $timeoutPhase = 'Reboot Offline Wait' }
+            elseif ($errorMessage -match 'RebootRequired|reboot.*check') { $timeoutPhase = 'Reboot Check' }
+            
+            # Set timeout status (does NOT set UpdatesStatus='Error')
+            # Runspace note: $GetUpdates runs in an isolated runspace where module
+            # functions like Set-ComputerTimeout do not resolve. The scriptblock is
+            # injected by New-ComputerRunspace under the name SetComputerTimeoutScript.
+            if ($SetComputerTimeoutScript) {
+                & $SetComputerTimeoutScript -Computer $Computer -Phase $timeoutPhase -TimeoutSec $searchTimeout -Detail $errorMessage
+            } else {
+                Set-ComputerTimeout -Computer $Computer -Phase $timeoutPhase -TimeoutSec $searchTimeout -Detail $errorMessage
             }
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+            Write-DebugLog "[$($Computer.Computer)] Timeout classified as recoverable: $timeoutPhase" -Level 'WARN'
+
+            # Phase E: WUA session/search timeouts auto-retry (max 2, 60s delay); Start-PendingUpdateCheck re-queues when RetryAt passes
+            if ($timeoutPhase -in @('WUA Session','Update Search') -and $Computer.RetryCount -lt 2) {
+                $retryDelaySec = 60
+                try {
+                    $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
+                        $uiHash.Listview.Items.EditItem($Computer)
+                        $Computer.RetryCount += 1
+                        $Computer.RetryAt = [DateTime]::Now.AddSeconds($retryDelaySec)
+                        $Computer.Status = "Timeout during $timeoutPhase - auto-retry $($Computer.RetryCount)/2 in ${retryDelaySec}s."
+                        $uiHash.Listview.Items.CommitEdit()
+                        $uiHash.Listview.Items.Refresh()
+                    })
+                    Write-DebugLog "[$($Computer.Computer)] Scheduled auto-retry $($Computer.RetryCount)/2 in ${retryDelaySec}s" -Level 'INFO'
+                } catch {
+                    Write-DebugLog "[$($Computer.Computer)] Failed to schedule auto-retry: $($_.Exception.Message)" -Level 'WARN'
+                }
+            }
+        }
+        else {
+            # Terminal error - grey row, Error status
+            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                $uiHash.Listview.Items.EditItem($Computer)
+                $computer.Status = "Error occurred: $errorMessage"
+                $computer.UpdatesStatus = 'Error'
+                $computer.State = 'Error'
+                # Set background color to grey for errored entries
+                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
+                if($listViewItem) {
+                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+                }
+                $uiHash.Listview.Items.CommitEdit()
+                $uiHash.Listview.Items.Refresh()
+            })
+        }
 
         #Cancel any remaining actions
         exit
@@ -2018,7 +2156,6 @@ $GetUpdates = {
 $InstallUpdates = {
     Param ($Computer)
     Try{
-        #Set path for psexec, scripts
         Set-Location $path
 
         #Update status
@@ -2026,42 +2163,45 @@ $InstallUpdates = {
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Installing $installCount Updates, this may take some time."
+            $computer.State = 'Installing'
             $computer.InstallErrors = 0
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
 
-        #Copy script to remote computer and execute using centralized paths
-        Copy-Item $ConfigPaths.InstallScript "\\$($Computer.computer)\c$" -Force
-        [int]$installErrors = & $ConfigPaths.PsExec -accepteula -nobanner -s "\\$($Computer.computer)" cmd.exe /c 'echo . | powershell.exe -ExecutionPolicy Bypass -file C:\Install-Patches.ps1'
-        Remove-Item "\\$($Computer.computer)\c$\Install-Patches.ps1"
-        if($LASTEXITCODE -ne 0){
-            throw "PsExec failed with error code $LASTEXITCODE"
+        $remoteCred = $null
+        if ($UseCustomCredentials -and $Computer.computer -ne 'localhost' -and $Computer.computer -ne $env:COMPUTERNAME) {
+            try { $remoteCred = & $GetRemoteCredentialsScript -ComputerName $Computer.computer -Operation 'Windows Update install' } catch { $remoteCred = $null }
         }
+        $onProgress = {
+            param($p)
+            if ($p.Phase -ne 'Installing') { return }
+            $progressText = "Installing $($p.Current)/$($p.Total): $($p.Title)"
+            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                $uiHash.Listview.Items.EditItem($Computer)
+                $Computer.Status = $progressText
+                $uiHash.Listview.Items.CommitEdit()
+                $uiHash.Listview.Items.Refresh()
+            })
+        }
+        $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.InstallScript -Operation 'Install' -Credential $remoteCred -ProgressCallback $onProgress
+        if (-not $taskResult.Success) {
+            throw "Remote install failed: $($taskResult.Error)"
+        }
+        $installErrors = $taskResult.Count
+        $rebootRequired = $taskResult.RebootRequired
 
         #Update status
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = 'Checking if a reboot is required.'
-            $computer.InstallErrors = $InstallErrors
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
-
-        #Check if any updates require reboot (uses the centralized PsExec path for runspace reliability)
-        $rebootRequired = (& $ConfigPaths.PsExec -accepteula -nobanner -s "\\$($Computer.computer)" cmd.exe /c 'echo . | powershell.exe -ExecutionPolicy Bypass -Command "&{return (New-Object -ComObject "Microsoft.Update.SystemInfo").RebootRequired}"') -eq $true
-        if($LASTEXITCODE -ne 0){
-            throw "PsExec failed with error code $LASTEXITCODE"
-        }
-
-        #Update status
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
+            $computer.InstallErrors = $installErrors
             if ($rebootRequired -eq $True) {
                 $computer.Status = 'Install complete. Reboot required.'
+                $computer.State = 'RebootRequired'
                 $computer.RebootRequired = $True
             } else {
                 $computer.Status = 'Install complete.'
+                $computer.State = 'Complete'
                 $computer.RebootRequired = $False
             }
             $uiHash.Listview.Items.CommitEdit()
@@ -2073,6 +2213,7 @@ $InstallUpdates = {
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = "Error occured: $($_.Exception.Message)"
             $computer.UpdatesStatus = 'Error'
+            $computer.State = 'Error'
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
             if($listViewItem) {
@@ -2099,6 +2240,7 @@ $RemoveOfflineComputer = {
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($computer)
             $computer.Status = 'Testing Connectivity.'
+            $computer.State = 'Connecting'
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
@@ -2107,6 +2249,7 @@ $RemoveOfflineComputer = {
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($computer)
                 $computer.Status = 'Online.'
+                $computer.State = 'Connected'
                 $uiHash.Listview.Items.CommitEdit()
                 $uiHash.Listview.Items.Refresh()
             })
@@ -2129,6 +2272,7 @@ $RemoveOfflineComputer = {
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($computer)
             $computer.Status = "Error occured: $($_.Exception.Message)"
+            $computer.State = 'Error'
             # Set background color to grey for errored entries
             $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
             if($listViewItem) {
@@ -2154,6 +2298,7 @@ $RestartComputer = {
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Restarting... Waiting for computer to shutdown.'
+            $computer.State = 'Rebooting'
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
@@ -2173,6 +2318,7 @@ $RestartComputer = {
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
             $computer.Status = 'Restarting... Waiting for computer to come online.'
+            $computer.State = 'Rebooting'
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
@@ -2208,19 +2354,42 @@ $RestartComputer = {
                 throw "Computer $($Computer.computer) did not come back online within 30 minutes of restarting."
             }
         }
-    }
-    catch{
+
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Error occured: $($_.Exception.Message)"
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
-            }
+            $computer.Status = 'Restart complete. Computer is online.'
+            $computer.State = 'Connected'
             $uiHash.Listview.Items.CommitEdit()
             $uiHash.Listview.Items.Refresh()
         })
+    }
+    catch{
+        # Reboot timeouts are RECOVERABLE - the computer may still come back online
+        $errorMsg = $_.Exception.Message
+        if ($errorMsg -match 'did not go offline|did not come (back )?online|timed out|timeout') {
+            $timeoutPhase = if ($errorMsg -match 'offline') { 'Reboot Offline Wait' } else { 'Reboot Online Wait' }
+            # Runspace note: inside the worker runspace, module functions do not exist -
+            # use the injected SetComputerTimeoutScript. The fallback covers direct UI usage.
+            if ($SetComputerTimeoutScript) {
+                & $SetComputerTimeoutScript -Computer $Computer -Phase $timeoutPhase -TimeoutSec $OnlineWaitSeconds -Detail $errorMsg
+            } else {
+                Set-ComputerTimeout -Computer $Computer -Phase $timeoutPhase -TimeoutSec $OnlineWaitSeconds -Detail $errorMsg
+            }
+            try { & $WriteDebugLogScript -Message "[$($Computer.Computer)] Reboot timeout classified as recoverable: $timeoutPhase" -Level 'WARN' } catch { }
+        } else {
+            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                $uiHash.Listview.Items.EditItem($Computer)
+                $computer.Status = "Error occured: $($_.Exception.Message)"
+                $computer.State = 'Error'
+                # Set background color to grey for errored entries
+                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
+                if($listViewItem) {
+                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+                }
+                $uiHash.Listview.Items.CommitEdit()
+                $uiHash.Listview.Items.Refresh()
+            })
+        }
 
         #Cancel any remaining actions
         exit
@@ -2330,10 +2499,11 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                                 $uiHash.Listview.Items.EditItem($computer)
                                 $computer.Status = "Operation timed out after 10 minutes"
                                 $computer.UpdatesStatus = 'Timeout'
-                                # Set background color to grey for timed out entries
+                                $computer.State = 'Timeout'
+                                # Timeout is recoverable - yellow, matching Set-ComputerTimeout
                                 $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
                                 if($listViewItem) {
-                                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+                                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow
                                 }
                                 $uiHash.Listview.Items.CommitEdit()
                                 $uiHash.Listview.Items.Refresh()
@@ -3342,6 +3512,8 @@ $eventAddFile = { #Add computers from CSV or TXT file with advanced options
 #region Update Operations
 $eventGetUpdates = {
     $uiHash.Listview.SelectedItems | ForEach-Object {
+        # Manual check resets the Phase-E auto-retry budget and cancels any scheduled retry
+        if ($_.PSObject.Properties['RetryCount']) { $_.RetryCount = 0; $_.RetryAt = $null }
         if (-not $_.Runspace) {
             # Item was never started (phase-gated or loaded from config): use the full startup path
             if ($_.PSObject.Properties['Pending']) { $_.Pending = $false }
@@ -3805,6 +3977,9 @@ $eventLoadConfig = {
                     try {
                         # Only load computer name and phase - all other data starts fresh
                         $computerObject = New-Object PSObject -Property @{
+                            State = 'Queued'
+                            StateTimestamp = Get-Date
+                            StateSource = 'BulkAdd'
                             Computer = if ($compData.Computer) { $compData.Computer } else { "Unknown" }
                             Phase = if ($compData.Phase) { $compData.Phase } else { "Phase 1" }
                             Available = 0  # Start fresh
@@ -3815,6 +3990,10 @@ $eventLoadConfig = {
                             UpdatesStatus = "Unknown"  # Start fresh
                             Runspace = $null
                             Pending = $false  # Loaded computers wait for a manual Check For Updates
+                            TimeoutExpiresAt = $null
+                            TimeoutSource = ''
+                            RetryCount = 0
+                            RetryAt = $null
                         }
                         
                         $uiHash.clientObservable.Add($computerObject)
@@ -4326,6 +4505,13 @@ $wuuContext = @{
     SearchTimeout               = $global:searchTimeout
     SessionTimeout              = $global:sessionTimeout
     RebootCheckTimeout          = $global:rebootCheckTimeout
+    CimTimeoutSeconds           = $global:CimTimeoutSeconds
+    ServiceTimeoutSeconds       = $global:ServiceTimeoutSeconds
+    PerformanceTimeoutSeconds   = $global:PerformanceTimeoutSeconds
+    CredProbeTimeoutSeconds     = $global:CredProbeTimeoutSeconds
+    RebootProbeTimeoutSeconds   = $global:RebootProbeTimeoutSeconds
+    OfflineWaitSeconds          = $global:OfflineWaitSeconds
+    OnlineWaitSeconds           = $global:OnlineWaitSeconds
     MaxConcurrentJobs           = $global:MaxConcurrentJobs
     GetUpdates                  = $GetUpdates
     BackgroundProcessing        = $global:backgroundProcessing
