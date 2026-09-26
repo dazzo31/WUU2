@@ -10,7 +10,8 @@ function Initialize-WuuWindowsUpdateContext {
     # Path, LogPath, LogLock, EnableDebugLogging, EnableEnhancedErrorHandling,
     # UseCustomCredentials, CustomCredentials, CredentialCache, PerformanceThreshold,
     # ConfigPaths, SearchTimeout, SessionTimeout, RebootCheckTimeout, MaxConcurrentJobs,
-    # GetUpdates, BackgroundProcessing, CredDialogXamlPath
+    # GetUpdates, DownloadUpdates, InstallUpdates, RestartComputer,
+    # BackgroundProcessing, CredDialogXamlPath
     param([Parameter(Mandatory)][hashtable]$Context)
     $script:WuuCtx = $Context
 }
@@ -485,7 +486,16 @@ function New-ComputerRunspace {
 }
 
 function Start-UpdateCheckJob {
-    param($ComputerItem)
+    param(
+        $ComputerItem,
+        # Optional follow-up operation to chain in a SINGLE pipeline. NEVER BeginInvoke a
+        # second pipeline onto a busy per-computer runspace from inside that runspace:
+        # the inner payload silently never runs and EndInvoke throws "pipeline already
+        # running" (root cause of auto-download/auto-install doing nothing). Chained
+        # ops run sequentially inside one BeginInvoke, exactly like $eventInstallUpdates.
+        [ValidateSet('Check','Download','InstallAndRecheck','AutoFlow')]
+        [string]$Op = 'Check'
+    )
     $ctx = $script:WuuCtx
     $GetUpdates = $ctx.GetUpdates; $jobs = $ctx.Jobs; $uiHash = $ctx.UiHash
     $PowerShell = $null
@@ -495,7 +505,27 @@ function Start-UpdateCheckJob {
             $ComputerItem.Runspace = New-ComputerRunspace -ComputerItem $ComputerItem
         }
 
-        $PowerShell = [powershell]::Create().AddScript($GetUpdates).AddArgument($ComputerItem)
+        # Compose the chain as ONE pipeline (multiple AddScript calls run sequentially
+        # in a single BeginInvoke when the runspace is free). DownloadUpdates receives
+        # the op so its auto-install tail can skip re-queuing when running mid-AutoFlow.
+        $PowerShell = [powershell]::Create()
+        switch ($Op) {
+            'Download'           { $PowerShell.AddScript($ctx.DownloadUpdates).AddArgument($ComputerItem).AddArgument($Op) | Out-Null }
+            'InstallAndRecheck'  {
+                $PowerShell.AddScript($ctx.InstallUpdates).AddArgument($ComputerItem) | Out-Null
+                $PowerShell.AddScript($ctx.RestartComputer).AddArgument($ComputerItem).AddArgument($true) | Out-Null
+                $PowerShell.AddScript($GetUpdates).AddArgument($ComputerItem) | Out-Null
+            }
+            'AutoFlow'           {
+                # Full unattended chain: download, then install/reboot/recheck. DownloadUpdates'
+                # own auto-install tail is suppressed by the $Op argument.
+                $PowerShell.AddScript($ctx.DownloadUpdates).AddArgument($ComputerItem).AddArgument($Op) | Out-Null
+                $PowerShell.AddScript($ctx.InstallUpdates).AddArgument($ComputerItem) | Out-Null
+                $PowerShell.AddScript($ctx.RestartComputer).AddArgument($ComputerItem).AddArgument($true) | Out-Null
+                $PowerShell.AddScript($GetUpdates).AddArgument($ComputerItem) | Out-Null
+            }
+            default              { $PowerShell.AddScript($GetUpdates).AddArgument($ComputerItem) | Out-Null }   # 'Check'
+        }
         $PowerShell.Runspace = $ComputerItem.Runspace
 
         #Save handle so we can later end the runspace
@@ -568,7 +598,13 @@ function Start-PendingUpdateCheck {
             continue
         }
         $item.Pending = $false
-        [void](Start-UpdateCheckJob -ComputerItem $item)
+        # Consume and clear any queued follow-up op so this item starts the right chain.
+        $op = 'Check'
+        if ($item.PSObject.Properties['PendingOp'] -and $item.PendingOp) {
+            $op = $item.PendingOp
+            $item.PendingOp = $null
+        }
+        [void](Start-UpdateCheckJob -ComputerItem $item -Op $op)
     }
 }
 

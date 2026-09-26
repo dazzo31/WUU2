@@ -59,7 +59,20 @@ Get-ChildItem -Path $repoRoot -Filter "*.md" -File | ForEach-Object {
 $zipPath = Join-Path $OutputDirectory $ZipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
-Compress-Archive -Path (Join-Path $staging "*") -DestinationPath $zipPath -Force
+# Compress-Archive's constructor intermittently throws (ConstructorInvokedThrowException)
+# when the destination is in the OneDrive-synced dist/ and leaves NO zip behind while
+# still reaching the success message below. Use the proven ZipFile API instead (matches
+# the beta.3 helper) and verify the archive actually exists with a real entry count.
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::CreateFromDirectory($staging, $zipPath)
 
-Write-Host "Created package: $zipPath" -ForegroundColor Green
+if (-not (Test-Path $zipPath)) {
+    throw "Packaging failed: zip was not created at $zipPath"
+}
+$verify = [IO.Compression.ZipFile]::OpenRead($zipPath)
+$entryCount = $verify.Entries.Count
+$verify.Dispose()
+if ($entryCount -lt 1) { throw "Packaging failed: zip at $zipPath has 0 entries" }
+
+Write-Host "Created package: $zipPath ($entryCount entries)" -ForegroundColor Green
 Write-Host "Staging folder: $staging" -ForegroundColor DarkGray

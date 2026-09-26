@@ -173,7 +173,7 @@ $global:LogLock = New-Object System.Object
 
 # Initialize debug log
 if ($global:EnableDebugLogging) {
-    Write-DebugLog "Windows Update Utility v1.1 Debug Log Started" -Level 'SUCCESS' -ToConsole
+    Write-DebugLog "Windows Update Utility v1.3.1-beta.4 Debug Log Started" -Level 'SUCCESS' -ToConsole
     Write-DebugLog "Log file: $global:LogPath" -Level 'INFO' -ToConsole
 }
 
@@ -1186,7 +1186,7 @@ $ClearComputerList = {
 
 #Download available updates
 $DownloadUpdates = {
-    Param ($Computer)
+    Param ($Computer, $Op)
     Try{
         Set-Location $path
 
@@ -1238,31 +1238,24 @@ $DownloadUpdates = {
             #Check if there are any updates that are downloaded and don't require user input
             $downloadedUpdates = $updatesHash[$Computer.computer] | Where-Object {$_.IsDownloaded -and $_.InstallationBehavior.CanRequestUserInput -eq $false}
             
-            if($downloadedUpdates){
-                #Update status to indicate auto-installation is starting
+            # Skip when this download is itself running inside an AutoFlow chain - that
+            # pipeline already continues into install+reboot+recheck, so re-queuing here
+            # would start a duplicate install on the same runspace.
+            $alreadyAutoFlow = ($Op -eq 'AutoFlow')
+            $alreadyPending = $false
+            if ($Computer.PSObject.Properties['Pending'] -and $Computer.Pending) { $alreadyPending = $true }
+            if($downloadedUpdates -and -not $alreadyAutoFlow -and -not $alreadyPending){
+                # Queue install as a follow-up (nested BeginInvoke on this busy runspace
+                # would silently never run the install payload).
                 $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                     $uiHash.Listview.Items.EditItem($Computer)
-                    $computer.Status = 'Auto-installing downloaded updates...'
+                    $computer.Status = 'Auto-install of downloaded updates queued...'
                     $computer.State = 'Installing'
+                    $Computer.PendingOp = 'InstallAndRecheck'
+                    $Computer.Pending   = $true
                     $uiHash.Listview.Items.CommitEdit()
                     $uiHash.Listview.Items.Refresh()
                 })
-                
-                #Start installation process
-                $temp = "" | Select-Object PowerShell,Runspace
-                $temp.PowerShell = [powershell]::Create().AddScript($InstallUpdates).AddArgument($Computer)
-                
-                # Automatically reboot after install if enabled
-                if($uiHash.AutoRebootCheckBox.IsChecked){
-                    $temp.PowerShell.AddScript($RestartComputer).AddArgument($Computer).AddArgument($true)
-                }
-                
-                $temp.PowerShell.AddScript($GetUpdates).AddArgument($Computer)
-                # Disable SetUpdatesStatus to prevent hanging
-                # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($Computer)
-                $temp.PowerShell.Runspace = $Computer.Runspace
-                $temp.Runspace = $temp.PowerShell.BeginInvoke()
-                $jobs.Add($temp) | Out-Null
             }
         }
     }
@@ -2039,23 +2032,18 @@ $GetUpdates = {
         
         #Auto-download if enabled and there are updates available
         if($uiHash.AutoDownloadCheckBox.IsChecked -and $computer.Available -gt 0 -and $computer.Available -gt $computer.Downloaded){
-            #Update status to indicate auto-download is starting
+            # Queue a follow-up download instead of nested-BeginInvoke on this busy runspace
+            # (a second pipeline started from inside the runspace silently never runs).
+            # If AutoInstall is also on, run the full unattended chain in ONE later pipeline.
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Auto-downloading available updates...'
+                $computer.Status = 'Auto-download of available updates queued...'
                 $computer.State = 'Downloading'
+                $Computer.PendingOp = if ($uiHash.AutoInstallCheckBox.IsChecked) { 'AutoFlow' } else { 'Download' }
+                $Computer.Pending   = $true
                 $uiHash.Listview.Items.CommitEdit()
                 $uiHash.Listview.Items.Refresh()
             })
-            
-            #Start download process
-            $temp = "" | Select-Object PowerShell,Runspace
-            $temp.PowerShell = [powershell]::Create().AddScript($DownloadUpdates).AddArgument($Computer)
-            # Disable SetUpdatesStatus to prevent hanging
-            # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($Computer)
-            $temp.PowerShell.Runspace = $Computer.Runspace
-            $temp.Runspace = $temp.PowerShell.BeginInvoke()
-            $jobs.Add($temp) | Out-Null
         }
     }
     Catch{
@@ -4514,6 +4502,9 @@ $wuuContext = @{
     OnlineWaitSeconds           = $global:OnlineWaitSeconds
     MaxConcurrentJobs           = $global:MaxConcurrentJobs
     GetUpdates                  = $GetUpdates
+    DownloadUpdates             = $DownloadUpdates
+    InstallUpdates              = $InstallUpdates
+    RestartComputer             = $RestartComputer
     BackgroundProcessing        = $global:backgroundProcessing
     CredDialogXamlPath          = Join-Path $WuuRoot 'ui\CredentialDialog.xaml'
 }
