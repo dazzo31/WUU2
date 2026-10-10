@@ -50,65 +50,265 @@ function Unprotect-Credential {
     }
 }
 
-function Get-RemoteCredentials {
+function Update-WuuCredentialEpoch {
+    <#
+    .SYNOPSIS Records that the credential configuration changed (Phase 2, R04).
+    .DESCRIPTION
+    Called whenever custom credentials are enabled, disabled or replaced.
+
+    WHY AN EPOCH IS NEEDED. A per-computer runspace is created ONCE and reused, and its injected
+    credential globals are captured at creation. So changing the credentials left every EXISTING row
+    resolving its identity from the runspace's stale copies - a newly submitted operation would run
+    under the OLD identity, silently, until the row happened to be recreated.
+
+    The epoch is stamped onto a row when its runspace is built (see Start-UpdateCheckJob). A submission
+    whose row carries a different epoch rebuilds the runspace, so a submitted operation always runs
+    under the identity configured AT SUBMISSION. That is the deterministic behaviour R04 asks for, and
+    it costs nothing when credentials have not changed.
+
+    TRANSPLANTED from WUU2-CLI src\Wuu.Credentials.psm1 (donor revision 0566164b...) - the mechanism is
+    identical because the defect it fixes is identical; only Write-DebugLog (already a target export)
+    is used.
+    #>
+    [CmdletBinding()]
+    param([string]$Reason = '')
+    $epoch = 0
+    if ($global:CredentialEpoch) { $epoch = [int]$global:CredentialEpoch }
+    $global:CredentialEpoch = $epoch + 1
+    $suffix = if ($Reason) { " ($Reason)" } else { '' }
+    Write-DebugLog "Credential configuration changed - epoch is now $($global:CredentialEpoch)$suffix" -Level 'INFO'
+    return $global:CredentialEpoch
+}
+
+function Resolve-WuuOperationCredential {
+    <#
+    .SYNOPSIS Decides, once, which credential identity an operation will use (Phase 2, R04).
+    .DESCRIPTION
+    THE RULE, stated plainly:
+
+        custom credentials configured  ->  the operation uses that credential.
+                                           If it does not work, that is a FAILURE.
+                                           It does NOT fall back to the default identity.
+
+    WHY THIS FUNCTION EXISTS. The previous resolver tried custom, and on failure tried the default and
+    returned it on success. So an administrator who configured alternate credentials could have an
+    operation run as the PROCESS identity instead - silently, with the operation succeeding and no
+    indication that the identity differed from the one configured. For a patch-deployment tool that is
+    an audit problem as much as a security one: you need to know which account changed a machine, and
+    "whichever one happened to work" is not an answer.
+
+    It also returns the MODE, which the old resolver could not: it returned $null for both "use the
+    default credential" and "no credential works", so every caller had to re-probe to tell them apart
+    and a caller that did not could not distinguish the two.
+
+    Returns:
+        Mode        'Custom' when custom credentials are configured and enabled, otherwise 'Default'
+        Credential  the [pscredential] to use, or $null meaning "the process identity"
+        Username    the identity, for reporting and audit ('' for the process identity)
+        Verified    $true/$false when -Verify was asked for; $null when it was not
+        Error       why verification failed (only when Verified is $false)
+        Reason      one short line explaining the decision, suitable for a log or an audit record
+
+    -Verify runs a bounded reachability+authentication probe. It is OPTIONAL on purpose: identity is
+    cheap to establish and can be fixed at submission time, whereas probing is a network round trip and
+    must not block a caller that is only queuing work.
+    #>
+    [CmdletBinding()]
     param(
-        [string]$ComputerName,
-        [string]$Operation = 'WMI access'
+        [string]$ComputerName = '',
+        # Run a probe to confirm this identity can actually authenticate. Off by default.
+        [switch]$Verify,
+        # Local machines are contacted as the process identity - passing explicit credentials to local
+        # DCOM is rejected. Callers that already know the target is local pass -Local.
+        [switch]$Local,
+        # Bounded probe timeout.
+        [int]$TimeoutSeconds = 5
     )
-    
-    try {
-        # Check cache first (runtime only, never persisted)
-        if ($global:CredentialCache.ContainsKey($ComputerName)) {
-            Write-DebugLog "Using cached credentials for $ComputerName" -Level 'DEBUG'
-            return $global:CredentialCache[$ComputerName]
-        }
-        
-        # Try custom configured credentials first if enabled
-        if ($global:UseCustomCredentials -and $global:CustomCredentials) {
-            try {
-                Write-DebugLog "Testing custom credentials for $ComputerName" -Level 'DEBUG'
-                # Use helper function for credential test
-                $wmiResult = Invoke-CimWithTimeout -ComputerName $ComputerName -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Credential $global:CustomCredentials -Operation 'Custom credential test'
-                
-                if ($wmiResult.Success) {
-                    # Custom credentials work, cache them (runtime cache only)
-                    Write-DebugLog "Custom credentials successful for $ComputerName, caching" -Level 'INFO'
-                    $global:CredentialCache[$ComputerName] = $global:CustomCredentials
-                    return $global:CustomCredentials
-                } else {
-                    Write-DebugLog "Custom credentials failed for $ComputerName : $($wmiResult.Error)" -Level 'WARN'
-                }
-            } catch {
-                Write-DebugLog "Custom credentials test failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
-            }
-        }
-        
-        # Custom credentials failed or not configured, try default credentials
+
+    $customConfigured = [bool]($global:UseCustomCredentials -and $global:CustomCredentials)
+
+    # Decided FIRST, so there is a single branch that can produce a non-custom identity.
+    $mode = if ($customConfigured -and -not $Local) { 'Custom' } else { 'Default' }
+    $credential = if ($mode -eq 'Custom') { $global:CustomCredentials } else { $null }
+    $username = ''
+    if ($mode -eq 'Custom' -and $credential) { $username = [string]$credential.UserName }
+
+    $reason = if ($mode -eq 'Custom') {
+        "custom credentials configured and enabled - using '$username' (no fallback)"
+    } elseif ($customConfigured -and $Local) {
+        "custom credentials are configured but '$ComputerName' is the local machine - using the process identity"
+    } else {
+        'custom credentials are not configured - using the process identity'
+    }
+
+    $verified = $null
+    $errorText = ''
+    if ($Verify -and $ComputerName) {
         try {
-            Write-DebugLog "Testing default credentials for $ComputerName" -Level 'DEBUG'
-            # Use helper function for default credential test
-            $wmiResult = Invoke-CimWithTimeout -ComputerName $ComputerName -ClassName 'Win32_ComputerSystem' -TimeoutSeconds 5 -Operation 'Default credential test'
-            
-            if ($wmiResult.Success) {
-                # Default credentials work, cache success (runtime cache only)
-                Write-DebugLog "Default credentials successful for $ComputerName, caching" -Level 'INFO'
-                $global:CredentialCache[$ComputerName] = $null  # null means use default credentials
-                return $null
+            if ($mode -eq 'Custom') {
+                $probe = Invoke-CimWithTimeout -ComputerName $ComputerName -ClassName 'Win32_ComputerSystem' `
+                    -TimeoutSeconds $TimeoutSeconds -Credential $credential -Operation "credential verification ($username)"
             } else {
-                Write-DebugLog "Default credentials failed for $ComputerName : $($wmiResult.Error)" -Level 'WARN'
+                $probe = Invoke-CimWithTimeout -ComputerName $ComputerName -ClassName 'Win32_ComputerSystem' `
+                    -TimeoutSeconds $TimeoutSeconds -Operation 'credential verification (process identity)'
+            }
+            if ($probe -and $probe.Success) {
+                $verified = $true
+            } else {
+                $verified = $false
+                $errorText = if ($probe -and $probe.Error) { [string]$probe.Error } else { 'the credential probe did not succeed' }
+                # DELIBERATE: no fallback attempt happens here, and none is offered.
+                $reason = "the $($mode.ToLower()) credential could not be verified: $errorText (no fallback attempted)"
             }
         } catch {
-            Write-DebugLog "Default credentials test failed for $ComputerName : $($_.Exception.Message)" -Level 'WARN'
+            $verified = $false
+            $errorText = $_.Exception.Message
+            $reason = "the $($mode.ToLower()) credential probe failed: $errorText (no fallback attempted)"
         }
-        
-        # Both failed - return null to indicate auth failure
-        # Caller will handle the error appropriately
-        Write-DebugLog "All credential tests failed for $ComputerName - returning null" -Level 'WARN'
-        return $null
-        
+    }
+
+    return [pscustomobject]@{
+        Mode       = $mode
+        Credential = $credential
+        Username   = $username
+        Verified   = $verified
+        Error      = $errorText
+        Reason     = $reason
+        Computer   = $ComputerName
+    }
+}
+
+function Get-WuuCredentialStateSignature {
+    <#
+    .SYNOPSIS A compact, NON-SECRET description of the active credential mode (R04).
+    .DESCRIPTION
+    Returns the identity part of the credential mode in use, so a saved configuration can record WHAT
+    it was saved with and a load can tell whether the running session matches.
+
+    Deliberately identity only: never a password, and never any part of one.
+
+    PSCredential.UserName is the authoritative source. Reading $global:CredentialConfig.Username
+    instead would be wrong: that variable is only assigned by the config dialog, so a credential set
+    some other way would be recorded as empty.
+    #>
+    [CmdletBinding()]
+    param()
+    $enabled = [bool]$global:UseCustomCredentials
+    $userName = ''
+    if ($enabled -and $global:CustomCredentials) { $userName = [string]$global:CustomCredentials.UserName }
+    return @{
+        Enabled  = $enabled
+        UserName = $userName
+        Mode     = if ($enabled) { 'custom' } else { 'current-process' }
+    }
+}
+
+function Test-WuuCredentialStateMatches {
+    <#
+    .SYNOPSIS Does the running credential session match what a configuration was saved with? (R04)
+    .DESCRIPTION
+    Loading a list saved with custom credentials into a session that had none (or the reverse) silently
+    changes which account every remote operation will use. Nothing fails - the operations simply run as
+    a different principal, which is a security-relevant difference that is invisible until an
+    access-denied appears on some host, or does not appear when it should.
+
+    Returns Match plus a human-readable Reason so the caller can warn with the SPECIFIC difference
+    rather than a vague "credential mismatch".
+    #>
+    [CmdletBinding()]
+    param([AllowNull()]$Saved)
+    $now = Get-WuuCredentialStateSignature
+    if (-not $Saved) {
+        return [pscustomobject]@{ Match = $true; Reason = 'the configuration records no credential mode (saved by an older build)'; SavedMode = ''; CurrentMode = $now.Mode }
+    }
+    $savedEnabled = $null
+    if ($Saved.PSObject.Properties['Enabled']) { $savedEnabled = [bool]$Saved.Enabled }
+    elseif ($Saved -is [hashtable] -and $Saved.ContainsKey('Enabled')) { $savedEnabled = [bool]$Saved['Enabled'] }
+    if ($null -eq $savedEnabled) {
+        return [pscustomobject]@{ Match = $true; Reason = 'the configuration does not state whether custom credentials were used'; SavedMode = ''; CurrentMode = $now.Mode }
+    }
+    $savedUser = ''
+    if ($Saved.PSObject.Properties['UserName']) { $savedUser = [string]$Saved.UserName }
+    elseif ($Saved -is [hashtable] -and $Saved.ContainsKey('UserName')) { $savedUser = [string]$Saved['UserName'] }
+
+    if ($savedEnabled -ne $now.Enabled) {
+        $savedMode = if ($savedEnabled) { 'custom' } else { 'current-process' }
+        return [pscustomobject]@{
+            Match = $false; SavedMode = $savedMode; CurrentMode = $now.Mode
+            Reason = "saved with '$savedMode' credentials but this session is using '$($now.Mode)'"
+        }
+    }
+    if ($savedEnabled -and $savedUser -and $now.UserName -and $savedUser -ne $now.UserName) {
+        return [pscustomobject]@{
+            Match = $false; SavedMode = 'custom'; CurrentMode = $now.Mode
+            Reason = "saved with custom credentials for '$savedUser' but this session is using '$($now.UserName)'"
+        }
+    }
+    return [pscustomobject]@{ Match = $true; Reason = ''; SavedMode = $now.Mode; CurrentMode = $now.Mode }
+}
+
+function Get-RemoteCredentials {
+    <#
+    .SYNOPSIS The credential for an operation on $ComputerName (Phase 2, R04).
+    .DESCRIPTION
+    Kept for its existing callers, and its CONTRACT IS DELIBERATELY UNCHANGED: it still returns a
+    [pscredential], or $null meaning "use the process identity". What changed is the part callers could
+    not previously rely on - it NO LONGER FALLS BACK to a different identity than the one configured.
+
+    Behaviour now:
+      * custom credentials configured and enabled -> that credential, or a FAILURE. The failure THROWS
+        (so the operation does not run as an unintended identity) with the reason attached. Callers that
+        prefer a reported error over an exception should use Resolve-WuuOperationCredential.
+      * custom credentials not configured -> $null (the process identity). The previous version also
+        probed the default credential here and returned $null either way, so the probe cost a round trip
+        per computer and changed nothing except the log.
+
+    The runtime cache is still honoured, but a cached entry can never contradict the configured mode.
+
+    NOTE ON LOCAL HOSTS: passing explicit credentials to local DCOM is rejected, exactly as the donor
+    notes, so a local target resolves to the process identity even when custom credentials are set.
+    #>
+    param(
+        [string]$ComputerName,
+        [string]$Operation = 'WMI access',
+        # Callers that already know the target is the local machine pass -Local, so the resolver does
+        # not offer an identity that local DCOM would reject anyway.
+        [switch]$Local
+    )
+
+    try {
+        # Resolve WITHOUT verification first, purely to learn the mode. Verification is a network round
+        # trip, and in the Default case there is nothing to verify that would change the outcome ($null
+        # is returned either way). Probing there is the wasted round trip per computer the previous
+        # version was criticised for.
+      $resolution = Resolve-WuuOperationCredential -ComputerName $ComputerName -Local:$Local
+
+        if ($resolution.Mode -eq 'Default') {
+            Write-DebugLog "Using the process identity for $ComputerName ($($resolution.Reason))" -Level 'DEBUG'
+            return $null
+        }
+
+        # Custom credentials are configured, so the identity MUST be established, not assumed: verify
+        # it, and fail if it is not usable. There is no third outcome.
+        $resolution = Resolve-WuuOperationCredential -ComputerName $ComputerName -Verify -Local:$Local
+
+        if (-not $resolution.Verified) {
+            # THROW rather than return $null. Returning $null here is what made the old silent fallback
+            # possible: $null legitimately means "use the process identity", so a failed custom
+            # credential became indistinguishable from "no custom credential configured", and the
+            # caller proceeded - as the wrong identity.
+            $msg = "Configured custom credentials for '$($resolution.Username)' cannot be used on $ComputerName for $Operation. $($resolution.Error)"
+            Write-ErrorLog $msg
+            throw $msg
+        }
+
+        Write-DebugLog "Custom credentials verified for $ComputerName as '$($resolution.Username)'" -Level 'INFO'
+        return $resolution.Credential
     } catch {
+        # A throw from the verification path above is intentional and must reach the caller.
+        if ($_.Exception.Message -match '^Configured custom credentials') { throw }
         Write-DebugLog "Error in Get-RemoteCredentials for $ComputerName : $($_.Exception.Message)" -Level 'ERROR'
-        return $null
+        throw
     }
 }
 
@@ -508,12 +708,20 @@ function Show-CredentialConfigDialog {
                     
                     # Clear credential cache when credentials change
                     $global:CredentialCache.Clear()
+                    # BUMP THE EPOCH. Every existing per-computer runspace captured the OLD credential
+                    # globals at creation, so without this a newly submitted operation would resolve its
+                    # identity from the stale copies - silently running as the previous account. The
+                    # submission point rebuilds a runspace whose stamped epoch differs.
+                    Update-WuuCredentialEpoch -Reason 'custom credentials configured' | Out-Null
                     
                     Write-DebugLog "Custom credentials configured for user: $username" -Level 'INFO'
                 } else {
                     $global:UseCustomCredentials = $false
                     $global:CustomCredentials = $null
                     $global:CredentialCache.Clear()
+                    # Same reason as above: disabling custom credentials changes the identity every
+                    # remote operation will use, so stale runspaces must not be reused.
+                    Update-WuuCredentialEpoch -Reason 'custom credentials disabled' | Out-Null
                     
                     Write-DebugLog "Custom credentials disabled" -Level 'INFO'
                 }
@@ -685,5 +893,5 @@ function Import-ComputerListConfig {
     }
 }
 
-Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig')
+Export-ModuleMember -Function @('Protect-Credential', 'Unprotect-Credential', 'Get-RemoteCredentials', 'Resolve-WuuOperationCredential', 'Update-WuuCredentialEpoch', 'Get-WuuCredentialStateSignature', 'Test-WuuCredentialStateMatches', 'Show-PasswordPrompt', 'Show-CustomCredentialDialog', 'Show-CredentialConfigDialog', 'Protect-ComputerListData', 'Unprotect-ComputerListData', 'Save-ComputerListConfig', 'Import-ComputerListConfig')
 

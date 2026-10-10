@@ -5,14 +5,17 @@ applyTo: "**/*.ps1, **/*.psm1, **/*.psd1"
 # PowerShell standards for WUU2
 
 ## Target runtime
-- Windows PowerShell 5.1, elevated, STA (`powershell.exe -STA`). Keep PowerShell 7 compatibility: `Get-CimInstance` not `Get-WmiObject`, `Invoke-Command` not `-ComputerName` remoting parameters, nested `Join-Path` not 3-arg form.
+- Windows PowerShell 5.1, elevated, STA (`powershell.exe -STA`). Keep PowerShell 7 compatibility: `Get-CimInstance` not `Get-WmiObject`, `Invoke-Command` not `-ComputerName` remoting parameters, nested `Join-Path` not the 3-arg form.
+
+## Layout
+- Application logic lives in `src\*.psm1`; `WUU.ps1` is a thin launcher. WPF layouts are in `ui\*.xaml`. Tests are in `tests\Test-*.ps1` and are run through `Scripts\Invoke-TestSuites.ps1`.
 
 ## Naming and correctness
 - Variable names are case-insensitive: never define two variables differing only by case (`$removeEntry` vs `$RemoveEntry` silently overwrite each other — this caused a real runspace leak). Never use `$host`, `$pid`, or other automatic-variable names as locals.
 - PascalCase approved Verb-Noun for functions; only real, documented cmdlets and parameters.
 - Single-quoted strings unless interpolating; here-strings for multi-line content (XAML); no unnecessary backticks.
 
-## Runspace and threading rules (critical in WUU.ps1)
+## Runspace and threading rules (critical)
 - UI updates from background runspaces MUST use `$uiHash.<Control>.Dispatcher.Invoke(...)`.
 - Scriptblocks injected into runspaces via `SessionStateProxy.SetVariable` MUST be unbound: `[scriptblock]::Create($sb.ToString())`. A literal `{...}` stays bound to the creating runspace and resolves variables there (usually `$null`).
 - Windows Update COM objects must stay in-process: never `Start-Job` (serialization strips COM methods). Use nested `[powershell]::Create()` + `BeginInvoke` polling for timeouts, and `Dispose()` on every path.
@@ -29,5 +32,6 @@ applyTo: "**/*.ps1, **/*.psm1, **/*.psd1"
 
 ## Validation before release
 - Parse check: `[System.Management.Automation.Language.Parser]::ParseFile(...)` must report zero errors.
-- Run `Scripts\Validate-Release.ps1` (XAML load + FindName check for every control wired with `Add_*` in WUU.ps1).
+- Run `Scripts\Validate-Release.ps1` (XAML load + `FindName` check for every control wired with `Add_*` in `src\Wuu.Core.psm1`).
+- Run `Scripts\Invoke-TestSuites.ps1`; never quote a SKIP or STALE suite as coverage.
 - Keep PSScriptAnalyzer clean (no unused variables).

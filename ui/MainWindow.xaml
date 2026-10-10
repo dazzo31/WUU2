@@ -177,6 +177,18 @@
             <Setter Property="FontSize" Value="13"/>
             <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
             <Style.Triggers>
+                <!-- COLOUR COMES FROM THE PROJECTED ROW (T006.1). The old code set
+                     ItemContainerGenerator.ContainerFromItem(...).Background imperatively from a worker;
+                     that is dead now the grid holds detached view rows, so the engine row's Colour name
+                     is projected and these triggers render it. Keep the selection/mouse-over triggers
+                     LAST so an active row still shows its highlight. -->
+                <DataTrigger Binding="{Binding Color}" Value="Timeout">
+                    <Setter Property="Background" Value="#FFFFE0"/>  <!-- LightYellow: recoverable timeout -->
+                </DataTrigger>
+                <DataTrigger Binding="{Binding Color}" Value="Error">
+                    <Setter Property="Background" Value="#D3D3D3"/>  <!-- LightGray: terminal error -->
+                    <Setter Property="Foreground" Value="Black"/>
+                </DataTrigger>
                 <Trigger Property="IsSelected" Value="True">
                     <Setter Property="Background" Value="{StaticResource AccentColor}"/>
                     <Setter Property="Foreground" Value="{StaticResource TextPrimary}"/>

@@ -1,6 +1,6 @@
-# Smoke test: load the REAL WUU.xaml, wire the REAL Set-ColumnProportionalWidths from WUU.ps1,
-# resize the window programmatically, and verify columns span the width. Closes itself.
-# Run: powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\Scripts\Test-ColumnResize.ps1
+# Smoke test: load the REAL ui\MainWindow.xaml, wire the REAL Set-ColumnProportionalWidths from
+# src\Wuu.Core.psm1, resize the window programmatically, and verify columns span the width. Closes itself.
+# Run: powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\tests\Test-ColumnResize.ps1
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path $PSScriptRoot -Parent
@@ -8,33 +8,38 @@ Set-Location $repo
 
 Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
 
-# --- extract Set-ColumnProportionalWidths from the real WUU.ps1 (AST) ---
+# --- extract Set-ColumnProportionalWidths from the REAL owning module (AST) ---
+# The function moved out of the root WUU.ps1 (now a thin launcher) into src\Wuu.Core.psm1
+# during the module split. It is MODULE-INTERNAL (Core exports only Import-WuuModules and
+# Start-WuuApplication), so it cannot be reached via Get-Command - extracting the text and
+# dot-sourcing it into a scope that holds $uiHash is what reproduces the app's own setup.
+$corePath = Join-Path $repo 'src\Wuu.Core.psm1'
 $tokens = $null; $parseErrors = $null
-$ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $repo 'WUU.ps1'), [ref]$tokens, [ref]$parseErrors)
-if ($parseErrors.Count -gt 0) { throw "WUU.ps1 parse errors: $($parseErrors.Count)" }
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($corePath, [ref]$tokens, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) { throw "Wuu.Core.psm1 parse errors: $($parseErrors.Count)" }
 $fn = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $a.Name -eq 'Set-ColumnProportionalWidths' }, $true) | Select-Object -First 1
-if (-not $fn) { throw 'Set-ColumnProportionalWidths not found in WUU.ps1' }
+if (-not $fn) { throw 'Set-ColumnProportionalWidths not found in src\Wuu.Core.psm1' }
 
-# --- environment like the app: uiHash + window from real XAML ---
+# --- environment like the app: uiHash + window from the real XAML ---
 $uiHash = [hashtable]::Synchronized(@{})
-$xamlFile = Join-Path $repo 'WUU.xaml'
+$xamlFile = Join-Path $repo 'ui\MainWindow.xaml'
 [xml]$xaml = Get-Content $xamlFile -Raw
 $reader = New-Object System.Xml.XmlNodeReader($xaml)
 $window = [Windows.Markup.XamlReader]::Load($reader)
 $uiHash.Window = $window
 $uiHash.ListView = $window.FindName('Listview')
 $uiHash.GridView = $window.FindName('GridView')
-if (-not $uiHash.ListView -or -not $uiHash.GridView) { throw 'Listview/GridView not found in XAML' }
+if (-not $uiHash.ListView -or -not $uiHash.GridView) { throw 'Listview/GridView not found in ui\MainWindow.xaml' }
 
 # --- load the real function into this session (dot-source a new scriptblock) ---
 . ([scriptblock]::Create($fn.Extent.Text))
 
 # --- also extract the real $eventWindowInit wiring and invoke it (SourceInitialized equivalent) ---
 $initAssign = $ast.FindAll({ param($a) $a -is [System.Management.Automation.Language.AssignmentStatementAst] -and $a.Left.Extent.Text -eq '$eventWindowInit' }, $true) | Select-Object -First 1
-if (-not $initAssign) { throw '$eventWindowInit not found in WUU.ps1' }
+if (-not $initAssign) { throw '$eventWindowInit not found in src\Wuu.Core.psm1' }
 
 # --- simulate the app's init: window shown, layout done ---
-function Pump-Dispatcher {
+function Invoke-DispatcherPump {
     # Process all queued dispatcher ops up to Background priority (includes Render).
     $frame = New-Object System.Windows.Threading.DispatcherFrame
     $null = $window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{ $frame.Continue = $false })
@@ -67,18 +72,18 @@ if ($initText.EndsWith('}')) { $initText = $initText.Substring(0, $initText.Leng
 . ([scriptblock]::Create($initText))
 Write-Host 'REAL $eventWindowInit wiring invoked.'
 # Pump the dispatcher so the BeginInvoke(Render) callback runs (grips + first fit)
-Pump-Dispatcher
+Invoke-DispatcherPump
 Start-Sleep -Milliseconds 100
-Pump-Dispatcher
+Invoke-DispatcherPump
 $window.UpdateLayout()
 $totalAfterInit = ($cols | Measure-Object -Property ActualWidth -Sum).Sum
 Write-Host ("After init auto-fit: total={0:N0} viewport={1:N0}" -f $totalAfterInit, $uiHash.ListView.ActualWidth)
 
 $window.Width = 400
 $window.UpdateLayout()
-Pump-Dispatcher   # SizeChanged defers the fit to Render priority - must pump
+Invoke-DispatcherPump   # SizeChanged defers the fit to Render priority - must pump
 Start-Sleep -Milliseconds 100
-Pump-Dispatcher
+Invoke-DispatcherPump
 $vw2 = $uiHash.ListView.ActualWidth
 $total2 = ($cols | Measure-Object -Property ActualWidth -Sum).Sum
 Write-Host ("At width 400 (auto): viewport={0:N0} total={1:N0} fits={2}" -f $vw2, $total2, ($total2 -le $vw2))
@@ -87,9 +92,9 @@ if ($total2 -le $vw2) { Write-Host '  PASS: columns fit small window (auto via S
 # --- TEST 3: widen window again (auto via SizeChanged) ---
 $window.Width = 1200
 $window.UpdateLayout()
-Pump-Dispatcher
+Invoke-DispatcherPump
 Start-Sleep -Milliseconds 100
-Pump-Dispatcher
+Invoke-DispatcherPump
 $total3 = ($cols | Measure-Object -Property ActualWidth -Sum).Sum
 $vw3 = $uiHash.ListView.ActualWidth
 Write-Host ("At width 1200 (auto): viewport={0:N0} total={1:N0} fits={2}" -f $vw3, $total3, ($total3 -le $vw3))
@@ -128,9 +133,9 @@ if ($computerKept -and $total5 -le $vw5 -and ($vw5 - $total5) -lt 3) { Write-Hos
 # --- TEST 6: tiny window with pinned minimums - must not exceed minimum sum, no crash ---
 $window.Width = 260
 $window.UpdateLayout()
-Pump-Dispatcher
+Invoke-DispatcherPump
 Start-Sleep -Milliseconds 100
-Pump-Dispatcher
+Invoke-DispatcherPump
 $total6 = ($cols | Measure-Object -Property ActualWidth -Sum).Sum
 Write-Host ("Tiny window: viewport={0:N0} total={1:N0} (horizontal scroll expected) sum>min*8={2}" -f $uiHash.ListView.ActualWidth, $total6, ($total6 -ge 8*40))
 if ($total6 -ge 8*40) { Write-Host '  PASS: minimums respected, no crash' } else { Write-Host '  FAIL: minimums violated' }

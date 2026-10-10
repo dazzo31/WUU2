@@ -170,16 +170,73 @@ function Invoke-WithPoolTimeout {
 function Close-WuuWorkerPool {
     <#
     .SYNOPSIS
-    Tears down the pool (app shutdown / tests). Safe to call repeatedly.
+    Tears down the pool (app shutdown / tests). Safe to call repeatedly, and BOUNDED.
+    .DESCRIPTION
+    WHY BOUNDED. RunspacePool.Close()/Dispose() join the pooled pipelines, and a pipeline stuck in an
+    uninterruptible native call (the abandoned-wrapper case in Invoke-WithPoolTimeout - a black-holed
+    DCOM/RPC probe) never returns, so an unbounded Close would hang the caller for ever. A teardown
+    path must always return.
+
+    HOW. The close runs in a DEDICATED helper runspace so the timeout can be observed without blocking
+    this thread; on timeout the helper is ABANDONED (same pattern as Invoke-WithPoolTimeout), because
+    disposing a PowerShell whose pipeline is stuck calls Stop() synchronously - the very block we are
+    avoiding. A bare .NET thread cannot be used: a PowerShell scriptblock on a thread with no runspace
+    fails with "There is no Runspace available to run scripts in this thread", and Add-Type of a
+    compiled helper proved unreliable here.
+
+    Returns $true when the pool closed within the deadline, $false when it was abandoned. The pool
+    reference is cleared either way, so a later Get-WuuWorkerPool re-opens lazily.
     #>
-    if ($script:WorkerPool) {
-        try {
-            if ($script:WorkerPool.RunspacePoolStateInfo.State -eq 'Opened') {
-                $script:WorkerPool.Close()
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$false)][int]$TimeoutSeconds = 15
+    )
+
+    $poolRef = $script:WorkerPool
+    $script:WorkerPool = $null
+    if (-not $poolRef) {
+        # No pool to close. Report the LAST real outcome rather than a blanket $true: if an earlier
+        # close ABANDONED a wedged pool, a later no-op must not report success and hide it.
+        return [bool]$script:WorkerPoolCloseOk
+    }
+
+    $ps = $null
+    $helperRunspace = $null
+    try {
+        $helperRunspace = [runspacefactory]::CreateRunspace([System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault())
+        $helperRunspace.ApartmentState = 'STA'
+        $helperRunspace.Open()
+        $helperRunspace.SessionStateProxy.SetVariable('WuuPoolToClose', $poolRef)
+        $ps = [powershell]::Create()
+        $ps.Runspace = $helperRunspace
+        [void]$ps.AddScript({
+            $p = $WuuPoolToClose
+            if ($p) {
+                try { $p.Close() } catch { }
+                try { $p.Dispose() } catch { }
             }
-            $script:WorkerPool.Dispose()
-        } catch { }
-        $script:WorkerPool = $null
+        })
+        $handle = $ps.BeginInvoke()
+        if ($handle.AsyncWaitHandle.WaitOne([System.TimeSpan]::FromSeconds($TimeoutSeconds))) {
+            try { $ps.EndInvoke($handle) | Out-Null } catch { }
+            try { $ps.Dispose() } catch { }
+            try { $helperRunspace.Close(); $helperRunspace.Dispose() } catch { }
+            $script:WorkerPoolCloseOk = $true
+            return $true
+        }
+
+        # Timed out: the pool close is wedged. Abandon the helper so this call still returns; there is
+        # no in-process way to reclaim a native-blocked pipeline.
+        if (-not $script:Abandoned) { $script:Abandoned = [System.Collections.Generic.List[object]]::new() }
+        $script:Abandoned.Add(@{ PowerShell = $ps; Runspace = $helperRunspace })
+        if ($script:Abandoned.Count -gt 32) { $script:Abandoned.RemoveAt(0) }
+        $script:WorkerPoolCloseOk = $false
+        return $false
+    } catch {
+        if ($ps) { try { $ps.Dispose() } catch { } }
+        if ($helperRunspace) { try { $helperRunspace.Close(); $helperRunspace.Dispose() } catch { } }
+        $script:WorkerPoolCloseOk = $false
+        return $false
     }
 }
 
@@ -256,11 +313,71 @@ function Test-WuuWorkerPool {
     }
 }
 
+function Close-WuuBoundedTeardown {
+    <#
+    .SYNOPSIS
+    Runs a teardown scriptblock in a DEDICATED helper runspace and ABANDONS it if it does not finish
+    within the deadline (T008.2). Never blocks the caller for ever, and never throws.
+    .DESCRIPTION
+    WHY THIS EXISTS. Several teardown paths (the per-job/per-computer runspaces at application exit, and
+    the job-cleanup runspace) call `.Stop()`/`.Close()`/`.Dispose()` on a pipeline that may be wedged in an
+    UNINTERRUPTIBLE native call (a black-holed DCOM/RPC probe). Those calls do not return, so an unbounded
+    teardown hangs the closing UI for ever. This mirrors the pattern already proven in
+    Close-WuuWorkerPool: run the work where a timeout can be OBSERVED without blocking this thread, and on
+    timeout ABANDON the helper (disposing a PowerShell whose pipeline is stuck calls Stop() synchronously -
+    the very block being avoided) while clearing our reference so the GC finalizer never runs on a stuck
+    pipeline.
+    .PARAMETER ScriptBlock The teardown work. It runs in an isolated runspace, so it may use only its own
+    parameters and whatever the caller passes in $ArgumentList plus the $WuuTeardownItems variable.
+    .PARAMETER ArgumentList Values passed to the scriptblock.
+    .PARAMETER TimeoutSeconds Deadline. On expiry the helper is abandoned.
+    Returns $true when it completed within the deadline, $false when abandoned or on error.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [Parameter(Mandatory=$false)][object[]]$ArgumentList = @(),
+        [Parameter(Mandatory=$false)][int]$TimeoutSeconds = 10
+    )
+
+    $ps = $null
+    $helperRunspace = $null
+    try {
+        $helperRunspace = [runspacefactory]::CreateRunspace([System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault())
+        $helperRunspace.ApartmentState = 'STA'
+        $helperRunspace.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $helperRunspace
+        [void]$ps.AddScript($ScriptBlock)
+        foreach ($arg in $ArgumentList) { [void]$ps.AddArgument($arg) }
+        $handle = $ps.BeginInvoke()
+        if ($handle.AsyncWaitHandle.WaitOne([System.TimeSpan]::FromSeconds($TimeoutSeconds))) {
+            try { $ps.EndInvoke($handle) | Out-Null } catch { }
+            try { $ps.Dispose() } catch { }
+            try { $helperRunspace.Close(); $helperRunspace.Dispose() } catch { }
+            return $true
+        }
+
+        # Timed out: a teardown call is wedged. Abandon the helper (do NOT dispose - that calls Stop() and
+        # would block here), keep a reference so the GC finalizer never runs on a stuck pipeline, and drop
+        # our own handles so this teardown cannot accumulate.
+        if (-not $script:Abandoned) { $script:Abandoned = [System.Collections.Generic.List[object]]::new() }
+        $script:Abandoned.Add(@{ PowerShell = $ps; Runspace = $helperRunspace })
+        if ($script:Abandoned.Count -gt 32) { $script:Abandoned.RemoveAt(0) }
+        return $false
+    } catch {
+        if ($ps) { try { $ps.Dispose() } catch { } }
+        if ($helperRunspace) { try { $helperRunspace.Close(); $helperRunspace.Dispose() } catch { } }
+        return $false
+    }
+}
+
 Export-ModuleMember -Function @(
     'Initialize-WuuWorkerPool',
     'Get-WuuWorkerPool',
     'Invoke-WithPoolTimeout',
     'Close-WuuWorkerPool',
+    'Close-WuuBoundedTeardown',
     'New-PooledInvokeScript',
     'Test-WuuWorkerPool'
 )

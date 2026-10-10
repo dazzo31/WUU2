@@ -53,6 +53,41 @@ $null = Invoke-ServiceWithTimeout -ComputerName localhost -ServiceName wuauserv 
 $pool2 = Get-WuuWorkerPool
 Assert-True ($pool1.InstanceId -eq $pool2.InstanceId) 'pool is reused across helpers (single instance)'
 
+# 6. ENVELOPE CONTRACT (a review claim that turned out FALSE, pinned so it cannot rot into truth).
+#    A reviewer asserted the Core-inlined CIM twin reads the wrong envelope level ($cimResult.Success
+#    instead of the inner .Result.Success). That is NOT the case: the pool wrapper is Success=$true
+#    whenever the scriptblock RAN, and the inner hashtable carries the real verdict - so a FAILED
+#    probe is wrapper.Success=$true with inner.Success=$false. Reading only the wrapper WOULD report
+#    every failure as success. Pin the real behaviour so a regression that flattens the envelope fails.
+$failedProbe = Invoke-CimWithTimeout -ComputerName '192.0.2.1' -TimeoutSeconds 3
+Assert-True (-not $failedProbe.Success) 'a FAILED probe reports Success=$false (the inner verdict, not the always-true pool wrapper)'
+Assert-True (-not $failedProbe.PSObject.Properties['Result']) 'a failed probe exposes no Result payload (no false success object)'
+
+# 7. THE TWO ENVELOPE SHAPES MUST AGREE. Wuu.Remote's Invoke-CimWithTimeout and Core's inlined copy
+#    (defined INSIDE the $GetUpdates payload - it is not a module function) are independent copies of the
+#    same unwrap; if one changes its shape the other callers break silently. The Core copy is extracted
+#    from the payload source rather than resolved by name.
+$remoteCopy = (Get-Command Invoke-CimWithTimeout -CommandType Function).ScriptBlock.ToString()
+$corePayloadSrc = [System.IO.File]::ReadAllText((Join-Path $RepoRoot 'src\Wuu.Core.psm1'))
+$twinMarker = 'function Invoke-CimWithTimeout {'
+$twinStart = $corePayloadSrc.IndexOf($twinMarker)
+Assert-True ($twinStart -ge 0) 'the Core payload defines its own inlined CIM twin'
+$twinBody = ''
+if ($twinStart -ge 0) {
+    # Brace-walk to the matching close of the twin body.
+    $depth = 1
+    $i = $twinStart + $twinMarker.Length
+    while ($i -lt $corePayloadSrc.Length -and $depth -gt 0) {
+        $ch = $corePayloadSrc[$i]
+        if ($ch -eq '{') { $depth++ } elseif ($ch -eq '}') { $depth-- }
+        $i++
+    }
+    $twinBody = $corePayloadSrc.Substring($twinStart + $twinMarker.Length, $i - $twinStart - $twinMarker.Length - 1)
+}
+Assert-True ($twinBody -match '\.Result\b') 'the Core inlined twin inspects the nested inner result (does not trust the always-true pool wrapper)'
+Assert-True ($twinBody -match 'Success\s*=\s*\$true;\s*Result\s*=\s*\$\w+\.Result') 'the Core inlined twin returns the SAME @{Success;Result} shape as the Wuu.Remote helper'
+Assert-True ($remoteCopy -match 'Success\s*=\s*\$true;\s*Result\s*=\s*\$\w+\.Result') 'the Wuu.Remote helper returns the same nested result shape (only the local variable name differs)'
+
 Close-WuuWorkerPool
 if ($failures.Count -eq 0) {
     Write-Host 'ALL PASS' -ForegroundColor Green

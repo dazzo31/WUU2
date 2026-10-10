@@ -9,8 +9,26 @@ function Import-WuuModules {
     # Loads all Wuu modules with -Global (required for cross-module visibility:
     # session-state isolation hides sibling exports otherwise). Both the app
     # startup and tests/Test-PendingDrain.ps1 use this single import path.
+    #
+    # ORDER IS BY ACTUAL DEPENDENCY, not by guesswork:
+    #   Wuu.Logging       - writing primitives, no sibling dependencies
+    #   Wuu.State         - the row/store/funnel contract. Presentation-agnostic and self-contained
+    #                       (verified: no sibling module calls). Must precede Configuration, whose
+    #                       Resolve-WuuVersion lives here.
+    #   Wuu.Models        - GUI state/collections built ON the row contract
+    #   Wuu.Configuration - Initialize-WuuConfiguration; resolves the version through Wuu.State
+    #   Wuu.Remote        - bounded remote ops; calls Invoke-WithPoolTimeout (Wuu.Workers)
+    #   Wuu.Network       - connectivity helpers used by Remote/Credentials
+    #   Wuu.Credentials   - credential resolver/dialogs and the shared computer-list config
+    #   Wuu.Workers       - the shared pool; depended on by Remote and Credentials
+    #   Wuu.WindowsUpdate - composes runspaces/jobs; depends on State, Remote, Workers
+    #   Wuu.Gui           - the WPF PROJECTION adapter (T006). Imported LAST on purpose: it is the only
+    #                       module permitted to touch WPF, and every module above must stay loadable
+    #                       and testable without it. Importing it last makes that ordering failure
+    #                       obvious rather than incidental - if a headless module ever grows a WPF
+    #                       dependency, it will not be Wuu.Gui that introduced it.
     param([Parameter(Mandatory)][string]$WuuRoot)
-    foreach ($m in @('Wuu.Logging','Wuu.Models','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate')) {
+    foreach ($m in @('Wuu.Logging','Wuu.State','Wuu.Models','Wuu.Configuration','Wuu.Remote','Wuu.Network','Wuu.Credentials','Wuu.Workers','Wuu.WindowsUpdate','Wuu.Gui')) {
         Import-Module (Join-Path $WuuRoot "src\$m.psm1") -Global -ErrorAction Stop
     }
 }
@@ -53,7 +71,7 @@ Enhanced Version - 2025-07-08
 - Added three automation levels:
   * Auto Reboot: Automatically reboots after installation if required
   * Auto Install: Automatically installs updates once downloaded
-  * Full Automation: Complete workflow (download â†’ install â†’ reboot â†’ re-check)
+  * Full Automation: Complete workflow (download -> install -> reboot -> re-check)
 - Added tooltips to UI elements for better user guidance
 - Improved error handling with auto-recovery attempts and detailed suggestions
 - Enhanced connectivity validation with multiple retry attempts
@@ -78,58 +96,15 @@ Enhanced Version - 2025-07-08
 
 #region Configuration
 
-# Toggle debug logging. Set to $true to enable detailed logging (performance impact).
-# WARNING: Enabling this creates large log files and reduces performance.
-$global:EnableDebugLogging = $true
-
-# Timeout settings (seconds)
-$global:sessionTimeout = 30       # Timeout for creating Windows Update session
-$global:searchTimeout = 300       # Timeout for update search operation
-$global:rebootCheckTimeout = 60   # Timeout for reboot check
-
-# Timeout settings for remote probes and bounded operations (seconds).
-# Centralised so remote probes no longer depend on hardcoded literals.
-$global:CimTimeoutSeconds         = 10   # was hardcoded 5 in Remote/Credentials probes
-$global:ServiceTimeoutSeconds     = 10   # was hardcoded 5
-$global:PerformanceTimeoutSeconds = 60   # was unbounded raw CIM in Get-SystemPerformance
-$global:CredProbeTimeoutSeconds   = 10   # was hardcoded 5 in WindowsUpdate runspace
-$global:RebootProbeTimeoutSeconds = 10   # online probe inside reboot wait
-$global:OfflineWaitSeconds        = 600  # was hardcoded inline in $RestartComputer
-$global:OnlineWaitSeconds         = 1800 # was hardcoded inline in $RestartComputer
-
-# Enhanced error handling toggle. Set to $true to enable advanced error handling.
-$global:EnableEnhancedErrorHandling = $true
-
-# Custom credentials for remote WMI queries
-$global:UseCustomCredentials = $false
-$global:CustomCredentials = $null
-$global:CredentialCache = @{}
-$global:CredentialConfig = @{ Username = ''; Domain = ''; UseCredentials = $false }
-
-# Job throttling for scalability
-$global:MaxConcurrentJobs = 10
-# Performance thresholds for operations
-$global:PerformanceThreshold = @{ CPUPercent = 80; MemoryMB = 1024; NetworkLatencyMs = 1000 }
-
-# Background processing control (synchronized for runspace access)
-$global:backgroundProcessing = [hashtable]::Synchronized(@{ Suspended = $false })
-
-# File paths and external tool configuration
-$global:ConfigPaths = @{
-    DownloadScript = Join-Path $WuuRoot 'Scripts\Download-Patches.ps1'
-    InstallScript = Join-Path $WuuRoot 'Scripts\Install-Patches.ps1'
-    ComputerListConfig = Join-Path $WuuRoot 'ComputerList.config'
-    LogDirectory = $WuuRoot
-}
-
-# Validation of required external files
-$requiredFiles = @('Scripts\Download-Patches.ps1', 'Scripts\Install-Patches.ps1')
-foreach ($file in $requiredFiles) {
-    $fullPath = Join-Path $WuuRoot $file
-    if (-not (Test-Path $fullPath)) {
-        Write-Warning "Required file not found: $fullPath - functionality may be impaired"
-    }
-}
+# All $global:* startup settings now live in ONE place: src\Wuu.Configuration.psm1, applied by
+# Initialize-WuuConfiguration. The block that used to sit here was MOVED, not changed - it is
+# still evaluated at exactly this point in startup, so every $global: is set before anything reads
+# it. The reason for the move was ownership, not behaviour: configuration tangled with orchestration
+# is not reachable from a headless test, and Wuu.State's per-operation deadline table had no home.
+#
+# The one DELIBERATE behaviour change is $global:EnableDebugLogging, which is now $false by default
+# (WUU_DEBUG=1 overrides). The full before/after table is in the module header of Wuu.Configuration.psm1.
+Initialize-WuuConfiguration -WuuRoot $WuuRoot
 
 #endregion Configuration
 
@@ -300,6 +275,105 @@ try {
 
 #region State Machine Helpers
 
+function Resolve-WuuSelectedRows {
+    <#
+    .SYNOPSIS
+    Resolves the current ListView selection to AUTHORITATIVE ENGINE ROWS, by key (T006.1).
+    .DESCRIPTION
+    Handlers used to act on `$uiHash.Listview.SelectedItems` - the VIEW objects. Today those happen to
+    be the same objects as the engine rows (the store mirrors by reference), so this is not a live bug;
+    but that identity is exactly what T006.1/T008.1 are going to break, and a handler that acts on a
+    view object would then act on a stale snapshot.
+
+    Resolving through the STORE, by the Computer key, makes handlers correct under either design: the
+    key survives every projection, sort and filter, and the store always yields the current owner of
+    that computer. The view-object path is kept as a fallback only so a handler still works in a rig
+    that has a ListView but no store.
+    #>
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$ListView = $null,
+        [Parameter(Mandatory=$false)][AllowNull()]$Store = $null
+    )
+
+    $rows = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $ListView) { return $rows.ToArray() }
+
+    # The KEY is read off the view object; the ROW comes from the store. Do not act on the view object.
+    foreach ($item in @($ListView.SelectedItems)) {
+        if ($null -eq $item) { continue }
+        $key = ''
+        if ($item.PSObject.Properties['Computer']) { $key = [string]$item.Computer }
+        if (-not $key) { continue }
+
+        $resolved = $null
+        if ($Store) {
+            try { $resolved = $Store.ByName[$key.ToLowerInvariant()] } catch { $resolved = $null }
+        }
+        if ($null -ne $resolved) { $rows.Add($resolved) | Out-Null }
+        # NO STORE AT ALL: the view object IS the row (a rig that has only a ListView). But when a store
+        # exists and the key is MISSING, the row was removed/replaced - returning the stale view object
+        # would hand every downstream fenced writer a row they must refuse, so an operation would consume
+        # a slot for its full deadline and write nothing. Return NOTHING instead.
+        elseif (-not $Store -and $item.PSObject.Properties['OperationId']) { $rows.Add($item) | Out-Null }
+    }
+    return $rows.ToArray()
+}
+
+function Update-WuuProjection {
+    <#
+    .SYNOPSIS
+    Reconciles the ListView's VIEW rows against a coherent engine snapshot (T006.1 / T008.1).
+    .DESCRIPTION
+    THE ONE PLACE THAT WRITES THE VIEW. Before this, the ListView held the ENGINE row objects by
+    reference: the store mirrored the same objects, so a worker write and a redraw were the same act
+    and the two states could not drift - because there were not two states. That coupling is why a
+    worker had to own a Dispatcher and why the grid WAS the database.
+
+    Now the ListView holds INDEPENDENT view rows produced by ConvertTo-WuuViewRow, reconciled by the
+    stable Computer key. Engine writes never touch them; this function is the only bridge. It is
+    revision-gated: Get-WuuViewSnapshot reads rows + revision coherently under the state gate, and a
+    snapshot older than the last one rendered is refused, so a projection tick queued before a change
+    cannot resurrect a removed row or a pre-reset display.
+
+    SAFETY. It takes the state gate only for the snapshot (bounded, non-fatal). If the gate is busy the
+    tick SKIPS rather than applying a torn fleet; the next tick retries. It must run on the UI thread.
+    #>
+    param(
+        [Parameter(Mandatory=$false)][AllowNull()]$Store = $null,
+        [Parameter(Mandatory=$false)][switch]$Force
+    )
+
+    $lv = $uiHash.Listview
+    if (-not $lv -or -not $lv.Dispatcher -or $lv.Dispatcher.HasShutdownStarted) { return }
+    if ($null -eq $uiHash.clientObservable) {
+        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
+        $lv.ItemsSource = $uiHash.clientObservable
+    }
+
+    $store = $Store
+    if (-not $store) { $store = $global:stateStore }
+    if (-not $store) { return }
+
+    $last = -1
+    if ($null -ne $script:lastRenderedRevision) { $last = [int]$script:lastRenderedRevision }
+
+    $snap = Get-WuuViewSnapshot -Store $store
+    # A torn read is worse than a late one: the gate was busy, so the row collection may be mid-swap.
+    if (-not $snap.Coherent) { return }
+    if (-not $Force -and [int]$snap.Revision -eq $last) { return }
+
+    $applied = ($Force -or [int]$snap.Revision -gt $last)
+    $null = Sync-WuuViewCollection -Collection $uiHash.clientObservable -EngineRows @($snap.Rows) -Revision $snap.Revision -AppliedRevision $last
+    # ADVANCE THE WATERMARK ONLY WHEN THE SNAPSHOT WAS APPLIED. Advancing unconditionally would let a
+    # REFUSED (superseded) snapshot move the watermark, so every later change at the same revision would
+    # be skipped - the fleet would freeze. `Sync` cannot signal the difference (an applied reconcile that
+    # adds nothing returns $null, same as a refusal), so the decision is made from the revision the
+    # caller already knows: the guard above returned on `Revision -eq Last`, and `Sync` refuses
+    # `Revision -lt Last`, so an arriving snapshot is applied exactly when `Revision -gt Last` (or
+    # `-Force` was given).
+    if ($applied) { $script:lastRenderedRevision = [int]$snap.Revision }
+}
+
 function Set-ComputerState {
     <#
     .SYNOPSIS
@@ -339,15 +413,13 @@ function Set-ComputerState {
         $statusString += " $StatusDetail"
     }
 
+    # DECOUPLED (T006.1): write the ENGINE row through the fenced writer. It used to set the fields on
+    # the ListView item, which only worked while the grid showed the engine rows themselves; under the
+    # projection the item is a snapshot the next reconcile overwrites.
     try {
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
-            $Computer.State = $State
-            $Computer.Status = $statusString
-            $uiHash.Listview.Items.CommitEdit()
-        })
+        Set-WuuComputerFencedFields -Row $Computer -Fields @{ State = $State; Status = $statusString } -Store $global:stateStore | Out-Null
     } catch {
-        Write-DebugLog "Set-ComputerState dispatcher failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+        Write-DebugLog "Set-ComputerState write failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
     }
 
     Write-DebugLog "[$($Computer.Computer)] State -> $State : $statusString" -Level 'DEBUG'
@@ -373,24 +445,21 @@ function Set-ComputerTimeout {
         [Parameter(Mandatory=$false)][string]$Detail = ''
     )
 
+    # DECOUPLED (T006.1): write the ENGINE row, not the ListView item. The colour is carried as the
+    # engine field Color ('Timeout') and rendered by the projection - the imperative
+    # ContainerFromItem(...).Background path is dead once the grid holds view rows.
     try {
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            $uiHash.Listview.Items.EditItem($Computer)
-            $Computer.TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
-            $Computer.TimeoutSource    = $Phase
-            $Computer.UpdatesStatus    = 'Timeout'
-            $Computer.State            = 'Timeout'
-            $detailSuffix = if ($Detail) { " $Detail" } else { '' }
-            $Computer.Status = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
-            # Timeout is recoverable - yellow, not the terminal-error grey
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if ($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow
-            }
-            $uiHash.Listview.Items.CommitEdit()
-        })
+        $detailSuffix = if ($Detail) { " $Detail" } else { '' }
+        Set-WuuComputerFencedFields -Row $Computer -Fields @{
+            TimeoutExpiresAt = [DateTime]::Now.AddSeconds($TimeoutSec)
+            TimeoutSource    = $Phase
+            UpdatesStatus    = 'Timeout'
+            State            = 'Timeout'
+            Status           = "Timeout during $Phase after ${TimeoutSec}s - continuing to monitor.$detailSuffix"
+            Color            = 'Timeout'
+        } -Store $global:stateStore | Out-Null
     } catch {
-        Write-DebugLog "Set-ComputerTimeout dispatcher failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
+        Write-DebugLog "Set-ComputerTimeout write failure for $($Computer.Computer): $($_.Exception.Message)" -Level 'WARN'
     }
 
     Write-DebugLog "[$($Computer.Computer)] TIMEOUT in $Phase after ${TimeoutSec}s. $Detail" -Level 'WARN'
@@ -702,7 +771,7 @@ function Suspend-BackgroundProcessing {
     $backgroundProcessing.Suspended = $true
     
     # Update status to show background processing is paused
-    Update-Status "â¸ï¸ Background processing paused for $Reason..."
+    Update-Status "Background processing paused for $Reason..."
     
     # Give a moment for any current operations to complete
     Start-Sleep -Milliseconds 500
@@ -718,8 +787,9 @@ function Resume-BackgroundProcessing {
     # Resume the job cleanup routine
     $backgroundProcessing.Suspended = $false
     
-    # Update status to show background processing is resumed
-    Update-Status "âœ… Background processing resumed after $CompletedOperation"
+    # Releasing the hold is NOT a statement about the operation's outcome: this runs from a finally, so it
+    # fires even when the operator cancels the password dialog. Keep it factual and neutral.
+    Update-Status "Background processing resumed (after $CompletedOperation)"
 }
 
 #endregion Helper Functions
@@ -735,39 +805,34 @@ function Resume-BackgroundProcessing {
 # need that busy worker runspace's engine to run -> guaranteed deadlock.
 # Only use PowerShell LANGUAGE constructs (foreach/if/property sets) in here.
 function SafeUpdateListViewItem {
+    <#
+    .SYNOPSIS
+    Applies a display patch to a computer's ENGINE row (no ListView coupling).
+    .DESCRIPTION
+    THE OLD BODY WROTE THE VIEW. It walked `$uiHash.Listview.Items` for the matching computer and set
+    fields on the ITEM, under a Dispatcher envelope. That was correct only while the ListView held the
+    engine rows by reference. Under the decoupled projection (T006.1) the ListView holds VIEW rows, so
+    such a write would land on a snapshot and be overwritten by the next projection.
+
+    It now resolves the ENGINE row from the store BY KEY and writes it through the fenced writer; the
+    projection repaints the view. Returns the fence verdict so a caller can tell an applied write from
+    a refused (superseded) one, exactly like the other fenced call sites.
+    #>
     param(
         [string]$ComputerName,
-        [hashtable]$Properties
+        [hashtable]$Properties,
+        [string]$OperationId = ''
     )
-    
-    # Check if GUI is ready and ListView is properly initialized
-    if (-not $uiHash.ListView -or -not $uiHash.clientObservable) {
-        return
-    }
-    
+
+    $row = $null
     try {
-        $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-            # Find the actual item in the ListView that corresponds to this computer
-            # (foreach loop, NOT a Where-Object pipeline - see comment above)
-            $actualItem = $null
-            foreach ($item in $uiHash.Listview.Items) {
-                if ($item.Computer -eq $ComputerName) { $actualItem = $item; break }
-            }
-            
-            if ($actualItem) {
-                $uiHash.Listview.Items.EditItem($actualItem)
-                
-                foreach ($propertyName in $Properties.Keys) {
-                    $actualItem.$propertyName = $Properties[$propertyName]
-                }
-                
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            }
-        })
-    } catch {
-        # Silently ignore ListView update errors during startup
-    }
+        if ($global:stateStore) { $row = $global:stateStore.ByName[$ComputerName.ToLowerInvariant()] }
+    } catch { $row = $null }
+    if (-not $row) { return @{ Applied = $false; Refused = $true; Reason = 'NoRow' } }
+
+    $writerId = $OperationId
+    if (-not $writerId) { try { $writerId = [string]$WuuOperationId } catch { $writerId = '' } }
+    return Set-WuuComputerFencedFields -Row $row -Fields $Properties -OperationId $writerId -Store $global:stateStore
 }
 
 #Add new computer(s) to list
@@ -801,7 +866,11 @@ $AddEntry = {
             continue
         }
         
-        if(($uiHash.Listview.Items | Select-Object -Expand Computer) -contains $computer){
+        # DEDUPE AGAINST THE ENGINE STORE, not the ListView. The grid holds VIEW rows now; the
+        # authoritative set of computers is the store.
+        $alreadyKnown = $false
+        try { $alreadyKnown = ($null -ne $global:stateStore.ByName[$computer.ToLowerInvariant()]) } catch { $alreadyKnown = $false }
+        if ($alreadyKnown) {
             Write-InfoLog "Skipping duplicate computer: $computer"
             continue
         }
@@ -832,14 +901,6 @@ $AddEntry = {
                 try {
                     Write-InfoLog "Direct execution for computer: $computer - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
                     
-                    # Initialize clientObservable if it doesn't exist
-                    if ($null -eq $uiHash.clientObservable) {
-                        Write-InfoLog "Initializing clientObservable for computer: $computer"
-                        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-                        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
-                        Write-InfoLog "clientObservable initialized successfully for computer: $computer"
-                    }
-                    
                     Write-InfoLog "Creating PSObject for computer: $computer"
                     $computerObject = New-Object PSObject -Property @{
                         State = 'Queued'
@@ -861,20 +922,21 @@ $AddEntry = {
                         RetryAt = $null
                     }
                     Write-InfoLog "PSObject created successfully for computer: $computer"
-                    
-                    Write-InfoLog "Adding PSObject to clientObservable for computer: $computer (Current count: $($uiHash.clientObservable.Count))"
-                    $uiHash.clientObservable.Add($computerObject)
-                    Write-InfoLog "PSObject added to clientObservable for computer: $computer (New count: $($uiHash.clientObservable.Count))"
-                    
-                    Write-InfoLog "Committing and refreshing ListView for computer: $computer"
+
+                    # ADD TO THE ENGINE STORE ONLY (T006.1). The ListView holds VIEW rows reconciled by
+                    # Update-WuuProjection; adding an engine row to the view collection would corrupt
+                    # that reconcile (the view would hold a non-projected object). Backfill the engine
+                    # contract first - a [pscustomobject] THROWS when assigning a property it was not
+                    # created with, so the fence needs the fields present before it can protect them -
+                    # then mirror into the store, then project the view from the store.
                     try {
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                        Write-InfoLog "ListView committed and refreshed for computer: $computer"
+                        Set-WuuRowEngineDefaults -Row $computerObject | Out-Null
+                        Add-WuuComputerRow -Store $global:stateStore -Row $computerObject | Out-Null
                     } catch {
-                        Write-InfoLog "ListView commit/refresh failed for computer: $computer - continuing anyway"
+                        Write-InfoLog "Engine backfill/mirror failed for $computer (continuing): $($_.Exception.Message)"
                     }
-                    
+                    Update-WuuProjection -Force
+
                     Write-InfoLog "Successfully added computer '$computer' to ListView (direct execution)"
                 } catch {
                     Write-ErrorLog "DIRECT EXECUTION ERROR for computer '$computer': $($_.Exception.Message)"
@@ -888,14 +950,6 @@ $AddEntry = {
                 $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 try {
                     Write-InfoLog "Inside dispatcher action for computer: $computer - Thread ID: $([System.Threading.Thread]::CurrentThread.ManagedThreadId)"
-                    
-                    # Initialize clientObservable if it doesn't exist (can happen when loading computer list before window initialization)
-                    if ($null -eq $uiHash.clientObservable) {
-                        Write-InfoLog "Initializing clientObservable for computer: $computer"
-                        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-                        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
-                        Write-InfoLog "clientObservable initialized successfully for computer: $computer"
-                    }
                     
                     Write-InfoLog "Creating PSObject for computer: $computer"
                     $computerObject = New-Object PSObject -Property @{
@@ -918,20 +972,16 @@ $AddEntry = {
                         RetryAt = $null
                     }
                     Write-InfoLog "PSObject created successfully for computer: $computer"
-                    
-                    Write-InfoLog "Adding PSObject to clientObservable for computer: $computer (Current count: $($uiHash.clientObservable.Count))"
-                    $uiHash.clientObservable.Add($computerObject)
-                    Write-InfoLog "PSObject added to clientObservable for computer: $computer (New count: $($uiHash.clientObservable.Count))"
-                    
-                    Write-InfoLog "Committing and refreshing ListView for computer: $computer"
+
+                    # ADD TO THE ENGINE STORE ONLY, THEN PROJECT - see the note at the Direct add site.
                     try {
-                        $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
-                        Write-InfoLog "ListView committed and refreshed for computer: $computer"
+                        Set-WuuRowEngineDefaults -Row $computerObject | Out-Null
+                        Add-WuuComputerRow -Store $global:stateStore -Row $computerObject | Out-Null
                     } catch {
-                        Write-InfoLog "ListView commit/refresh failed for computer: $computer - continuing anyway"
+                        Write-InfoLog "Engine backfill/mirror failed for $computer (continuing): $($_.Exception.Message)"
                     }
-                    
+                    Update-WuuProjection -Force
+
                     Write-InfoLog "Successfully added computer '$computer' to ListView"
                 } catch {
                     Write-ErrorLog "DISPATCHER ERROR for computer '$computer': $($_.Exception.Message)"
@@ -1011,7 +1061,8 @@ $eventAssignPhase = {
     Param($phase)
     try {
         Write-InfoLog "Phase assignment started for phase: $phase"
-        $selectedComputers = @($uiHash.Listview.SelectedItems)
+        # Resolve the selection to AUTHORITATIVE engine rows by key - the grid holds view rows now.
+        $selectedComputers = @(Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore)
         
         if ($selectedComputers.Count -gt 0) {
         Write-InfoLog "Assigning $($selectedComputers.Count) computers to $phase"
@@ -1019,8 +1070,8 @@ $eventAssignPhase = {
         
         ForEach ($Computer in $selectedComputers) {
             try {
-                # Safer approach: modify property directly and refresh once
-                $Computer.Phase = $phase
+                # Write the ENGINE row (the view is a projection and is repainted by the tick).
+                Set-WuuComputerFencedFields -Row $Computer -Fields @{ Phase = $phase } -Store $global:stateStore | Out-Null
                 Write-InfoLog "Assigned $($Computer.Computer) to $phase"
                 $computerNames += $Computer.Computer
             } catch {
@@ -1029,10 +1080,10 @@ $eventAssignPhase = {
             }
         }
         
-        # Refresh the view once after all updates
+        # Repaint the view from the engine rows we just changed.
         try {
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.Refresh()
+                Update-WuuProjection -Force
             })
             Write-InfoLog "List view refreshed after phase assignment"
         } catch {
@@ -1132,14 +1183,14 @@ $removeEntry = {
                 }
             }
             
-            # Remove from UI with proper thread safety
+            # REMOVE THE ENGINE ROW, THEN PROJECT (T006.1). The store is authoritative; the view is
+            # rebuilt from it. Without removing the row the store would accumulate computers the
+            # operator deleted, and the worker twin would resolve a deleted computer to a stale row
+            # and happily write to it.
+            try { Remove-WuuComputerRow -Store $global:stateStore -Computer $Computer.Computer | Out-Null } catch { }
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 try {
-                    # Check if clientObservable exists before trying to remove from it
-                    if ($uiHash.clientObservable) {
-                        $uiHash.clientObservable.Remove($Computer)
-                    }
-                    $uiHash.Listview.Items.Refresh()
+                    Update-WuuProjection -Force
                 } catch {
                     Write-WarningLog "Failed to remove UI item for $($Computer.Computer): $($_.Exception.Message)"
                 }
@@ -1159,8 +1210,10 @@ $removeEntry = {
 $clearComputerList = {
     Write-InfoLog "Clearing all computers from list"
     
-    # Get all computers before clearing
-    $allComputers = @($uiHash.Listview.Items)
+    # Source the list from the ENGINE STORE (the authoritative set), not the ListView, which now holds
+    # VIEW rows.
+    $allComputers = @()
+    try { $allComputers = @($global:stateStore.Rows) } catch { $allComputers = @() }
     
     if ($allComputers.Count -gt 0) {
         # Remove all computers using the removeEntry ScriptBlock
@@ -1173,11 +1226,6 @@ $clearComputerList = {
     } else {
         Update-StatusBackground 'Computer list is already empty.'
     }
-}
-
-# Clear computer list (legacy alias)
-$ClearComputerList = {
-    &$clearComputerList
 }
 
 #endregion ScriptBlocks
@@ -1196,10 +1244,13 @@ $DownloadUpdates = {
         #Update status
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Downloading $($dlStats.Count) Updates ($([math]::Round($dlStats.Sum/1MB))MB)."
-            $computer.State = 'Downloading'
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Downloading $($dlStats.Count) Updates ($([math]::Round($dlStats.Sum/1MB))MB)."; State = 'Downloading' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Downloading $($dlStats.Count) Updates ($([math]::Round($dlStats.Sum/1MB))MB)."; State = 'Downloading' }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         $remoteCred = $null
@@ -1212,10 +1263,36 @@ $DownloadUpdates = {
             $progressText = "Downloading $($p.Current)/$($p.Total): $($p.Title)"
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $Computer.Status = $progressText
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = $progressText }
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = $progressText }
+                }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
+        }
+        # EFFECT-BOUNDARY GUARD (G6): revalidate ownership immediately before the real remote
+        # download. A superseded/reset/replaced row must not pull patches off the wire.
+        $effectAuth = & $TestEffectAuthorizedScript -Computer $Computer
+        if (-not $effectAuth.Authorized) {
+            # A REFUSAL IS A CLEAN OUTCOME, NOT A FAILURE (see the helper's contract). Report it and
+            # return WITHOUT throwing: the shared Catch would paint State='Error', arm a stale
+            # auto-retry and abort the rest of the chain for an operation that simply no longer owns
+            # the computer. No State/UpdatesStatus change means phase accounting does not count it.
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                    $uiHash.Listview.Items.EditItem($Computer)
+                    $refusalResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    } else {
+                        Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    }
+                    $uiHash.Listview.Items.CommitEdit()
+                    if ($refusalResult.Applied) { $uiHash.Listview.Items.Refresh() }
+                })
+            } catch { }
+            return
         }
         $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.DownloadScript -Operation 'Download' -Credential $remoteCred -ProgressCallback $onProgress
         if (-not $taskResult.Success) {
@@ -1224,13 +1301,18 @@ $DownloadUpdates = {
         $numDownloaded = $taskResult.Count
 
         #Update status
+        # Downloaded is read-modify-write (+= numDownloaded), so the new total is computed from the row
+        # and written in the same patch.
+        $newDownloadedTotal = [int]$Computer.Downloaded + [int]$numDownloaded
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = 'Download complete.'
-            $computer.State = 'UpdatesFound'
-            $computer.Downloaded += $numDownloaded
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Download complete.'; State = 'UpdatesFound'; Downloaded = $newDownloadedTotal }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Download complete.'; State = 'UpdatesFound'; Downloaded = $newDownloadedTotal }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
         
         #Auto-install if enabled and there are downloaded updates ready for installation
@@ -1249,12 +1331,16 @@ $DownloadUpdates = {
                 # would silently never run the install payload).
                 $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                     $uiHash.Listview.Items.EditItem($Computer)
-                    $computer.Status = 'Auto-install of downloaded updates queued...'
-                    $computer.State = 'Installing'
-                    $Computer.PendingOp = 'InstallAndRecheck'
-                    $Computer.Pending   = $true
+                    $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Auto-install of downloaded updates queued...'; State = 'Installing' }
+                    } else {
+                        Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Auto-install of downloaded updates queued...'; State = 'Installing' }
+                    }
+                    # Queue through the precedence policy (never a raw assignment).
+                    if ($SetPendingOpScript) { & $SetPendingOpScript -Computer $Computer -Op 'InstallAndRecheck' | Out-Null }
+                    else { Set-WuuPendingOperation -Row $Computer -Op 'InstallAndRecheck' | Out-Null }
                     $uiHash.Listview.Items.CommitEdit()
-                    $uiHash.Listview.Items.Refresh()
+                    if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
                 })
             }
         }
@@ -1262,16 +1348,15 @@ $DownloadUpdates = {
     Catch{
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Error occured: $($_.Exception.Message)."
-            $computer.UpdatesStatus = 'Error'
-            $computer.State = 'Error'
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)."; UpdatesStatus = 'Error'; State = 'Error' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)."; UpdatesStatus = 'Error'; State = 'Error' }
             }
+            # No imperative colouring: the grid holds detached view rows, so the item container is not the
+            # row. The error colour comes from the projected Color field (the 'Error' State maps to it).
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         #Cancel any remaining actions
@@ -1503,10 +1588,13 @@ $GetUpdates = {
         #Update status
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = 'Validating connectivity and services...'
-            $computer.State = 'Connecting'
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Validating connectivity and services...'; State = 'Connecting' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Validating connectivity and services...'; State = 'Connecting' }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         Set-Location $path
@@ -1530,9 +1618,13 @@ $GetUpdates = {
             }
             $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Checking system dependencies...'
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Checking system dependencies...' }
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Checking system dependencies...' }
+                }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
             
             # Skip complex dependency checking - just assume local connectivity
@@ -1545,9 +1637,13 @@ $GetUpdates = {
             
             $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = $depStatus
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = $depStatus }
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = $depStatus }
+                }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
             
             Start-Sleep -Seconds 2
@@ -1623,9 +1719,13 @@ $GetUpdates = {
                     $errorMessage = "Computer $($Computer.computer) is not reachable (ping timeout after 2s). Check network connectivity, firewall ICMP rules, or verify the computer exists."
                     $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                         $uiHash.Listview.Items.EditItem($Computer)
-                        $computer.Status = $errorMessage
+                        $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                            & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = $errorMessage }
+                        } else {
+                            Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = $errorMessage }
+                        }
                         $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
+                        if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
                     })
                     throw $errorMessage
                 }
@@ -1695,6 +1795,11 @@ $GetUpdates = {
                     if ($Computer.computer -eq 'localhost' -or $Computer.computer -eq $env:COMPUTERNAME) {
                         $wuService = Get-Service -Name "wuauserv" -ErrorAction Stop
                     } else {
+                        # EFFECT-BOUNDARY GUARD (G6): the pre-flight SERVICE ACTION is a real remote
+                        # effect (it can start wuauserv on the host). A superseded operation must not
+                        # perform it - return cleanly, exactly like the other effect guards.
+                        $svcAuth = & $TestEffectAuthorizedScript -Computer $Computer
+                        if (-not $svcAuth.Authorized) { return }
                         $serviceResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Check' -TimeoutSeconds 5
                         
                         if ($serviceResult -and $serviceResult.Success) {
@@ -1717,6 +1822,9 @@ $GetUpdates = {
                             Write-Warning "Windows Update service is not running on $($Computer.computer). Attempting to start..."
                             
                             # Best-effort start: failure here is not fatal either (COM search auto-starts)
+                            # G6: this STARTS a service on the remote host - guard it like the other effects.
+                            $startAuth = & $TestEffectAuthorizedScript -Computer $Computer
+                            if (-not $startAuth.Authorized) { return }
                             $startResult = Invoke-ServiceWithTimeout -ComputerName $Computer.computer -ServiceName 'wuauserv' -Action 'Start' -TimeoutSeconds 10 -PostActionDelay 5
                             
                             if ($startResult -and $startResult.Success) {
@@ -1748,10 +1856,13 @@ $GetUpdates = {
                 # Update status for COM object creation
                 $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                     $uiHash.Listview.Items.EditItem($Computer)
-                    $computer.Status = "Creating Windows Update session (attempt $retryCount/$maxRetries)..."
-                    $computer.State = 'Checking'
+                    $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Creating Windows Update session (attempt $retryCount/$maxRetries)..."; State = 'Checking' }
+                    } else {
+                        Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Creating Windows Update session (attempt $retryCount/$maxRetries)..."; State = 'Checking' }
+                    }
                     $uiHash.Listview.Items.CommitEdit()
-                    $uiHash.Listview.Items.Refresh()
+                    if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
                 })
                 
                 # Try to create the COM instance with timeout
@@ -1810,6 +1921,10 @@ $GetUpdates = {
                         # Try auto-recovery if available
                         $recoveryAttempted = $false
                         if ($errorInfo.AutoFix) {
+                            # G6: Invoke-AutoRecovery can RESTART SERVICES on the remote host - a real
+                            # remote effect. A superseded operation must not dispatch it.
+                            $recoveryAuth = & $TestEffectAuthorizedScript -Computer $Computer
+                            if (-not $recoveryAuth.Authorized) { return }
                             SafeUpdateListViewItem $Computer.computer @{
                                 Status = "Attempting automatic recovery for: $($errorInfo.Description)..."
                             }
@@ -1958,32 +2073,35 @@ $GetUpdates = {
         try {
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Available = $adjustedAvailableCount
-                $computer.Downloaded = $dlCount
-                $computer.RebootRequired = $rebootRequired
-                $computer.RetryCount = 0
-                $computer.RetryAt = $null
-                
-                # Set UpdatesStatus for color scheme and update Status column
-                if ($adjustedAvailableCount -gt 0) {
-                    $computer.UpdatesStatus = 'Updates required'
-                    $computer.Status = "$($adjustedAvailableCount) update(s) found. Right-click > Download Updates."
-                    $computer.State = 'UpdatesFound'
-                } else {
-                    # Check if reboot is required based on our simplified logic
-                    if ($rebootRequired) {
-                        $computer.UpdatesStatus = 'Reboot required'
-                        $computer.Status = 'Up-to-date. Reboot required to complete previous installations.'
-                        $computer.State = 'RebootRequired'
-                    } else {
-                        $computer.UpdatesStatus = 'All updates installed'
-                        $computer.Status = 'Up-to-date. No updates available.'
-                        $computer.State = 'Complete'
-                    }
+                # ONE patch for the whole result: counters + retry reset + display, so a reader never
+                # sees counts updated while the status text still describes the previous operation.
+                $resultFields = @{
+                    Available      = $adjustedAvailableCount
+                    Downloaded     = $dlCount
+                    RebootRequired = $rebootRequired
+                    RetryCount     = 0
+                    RetryAt       = $null
                 }
-                
+                if ($adjustedAvailableCount -gt 0) {
+                    $resultFields['UpdatesStatus'] = 'Updates required'
+                    $resultFields['Status'] = "$($adjustedAvailableCount) update(s) found. Right-click > Download Updates."
+                    $resultFields['State'] = 'UpdatesFound'
+                } elseif ($rebootRequired) {
+                    $resultFields['UpdatesStatus'] = 'Reboot required'
+                    $resultFields['Status'] = 'Up-to-date. Reboot required to complete previous installations.'
+                    $resultFields['State'] = 'RebootRequired'
+                } else {
+                    $resultFields['UpdatesStatus'] = 'All updates installed'
+                    $resultFields['Status'] = 'Up-to-date. No updates available.'
+                    $resultFields['State'] = 'Complete'
+                }
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields $resultFields
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields $resultFields
+                }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
         } catch {
             # If UI update fails, just log it but don't crash
@@ -2037,12 +2155,18 @@ $GetUpdates = {
             # If AutoInstall is also on, run the full unattended chain in ONE later pipeline.
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = 'Auto-download of available updates queued...'
-                $computer.State = 'Downloading'
-                $Computer.PendingOp = if ($uiHash.AutoInstallCheckBox.IsChecked) { 'AutoFlow' } else { 'Download' }
-                $Computer.Pending   = $true
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Auto-download of available updates queued...'; State = 'Downloading' }
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Auto-download of available updates queued...'; State = 'Downloading' }
+                }
+                # Queue through the precedence policy, never a raw assignment: a raw write could
+                # DOWNGRADE an 'AutoFlow' the operator already queued.
+                $queuedOp = if ($uiHash.AutoInstallCheckBox.IsChecked) { 'AutoFlow' } else { 'Download' }
+                if ($SetPendingOpScript) { & $SetPendingOpScript -Computer $Computer -Op $queuedOp | Out-Null }
+                else { Set-WuuPendingOperation -Row $Computer -Op $queuedOp | Out-Null }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
         }
     }
@@ -2089,7 +2213,9 @@ $GetUpdates = {
             # functions like Set-ComputerTimeout do not resolve. The scriptblock is
             # injected by New-ComputerRunspace under the name SetComputerTimeoutScript.
             if ($SetComputerTimeoutScript) {
-                & $SetComputerTimeoutScript -Computer $Computer -Phase $timeoutPhase -TimeoutSec $searchTimeout -Detail $errorMessage
+                $timeoutWrite = & $SetComputerTimeoutScript -Computer $Computer -Phase $timeoutPhase -TimeoutSec $searchTimeout -Detail $errorMessage
+                if ($timeoutWrite.Refused) { return }
+                if (-not $timeoutWrite.Applied) { throw 'Timeout writer returned no applied/refused verdict' }
             } else {
                 Set-ComputerTimeout -Computer $Computer -Phase $timeoutPhase -TimeoutSec $searchTimeout -Detail $errorMessage
             }
@@ -2101,11 +2227,18 @@ $GetUpdates = {
                 try {
                     $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
                         $uiHash.Listview.Items.EditItem($Computer)
-                        $Computer.RetryCount += 1
-                        $Computer.RetryAt = [DateTime]::Now.AddSeconds($retryDelaySec)
-                        $Computer.Status = "Timeout during $timeoutPhase - auto-retry $($Computer.RetryCount)/2 in ${retryDelaySec}s."
+                        # RetryCount/RetryAt are fenced bookkeeping (the writer allows them); the STATUS
+                        # text needs the incremented count, so compute it from the captured count.
+                        $nextRetryCount = [int]$Computer.RetryCount + 1
+                        $retryStatusText = "Timeout during $timeoutPhase - auto-retry $nextRetryCount/2 in ${retryDelaySec}s."
+                        $retryFields = @{ RetryCount = $nextRetryCount; RetryAt = [DateTime]::Now.AddSeconds($retryDelaySec); Status = $retryStatusText }
+                        $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                            & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields $retryFields
+                        } else {
+                            Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields $retryFields
+                        }
                         $uiHash.Listview.Items.CommitEdit()
-                        $uiHash.Listview.Items.Refresh()
+                        if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
                     })
                     Write-DebugLog "[$($Computer.Computer)] Scheduled auto-retry $($Computer.RetryCount)/2 in ${retryDelaySec}s" -Level 'INFO'
                 } catch {
@@ -2117,16 +2250,14 @@ $GetUpdates = {
             # Terminal error - grey row, Error status
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = "Error occurred: $errorMessage"
-                $computer.UpdatesStatus = 'Error'
-                $computer.State = 'Error'
-                # Set background color to grey for errored entries
-                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-                if($listViewItem) {
-                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occurred: $errorMessage"; UpdatesStatus = 'Error'; State = 'Error' } 
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occurred: $errorMessage"; UpdatesStatus = 'Error'; State = 'Error' }
                 }
+                # No imperative colouring - see the note at the first error path. Colour is projected.
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
         }
 
@@ -2150,11 +2281,13 @@ $InstallUpdates = {
         $installCount = ($updatesHash[$Computer.computer] | Where-Object {$_.IsDownloaded -eq $true -and $_.InstallationBehavior.CanRequestUserInput -eq $false} | Measure-Object).Count
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Installing $installCount Updates, this may take some time."
-            $computer.State = 'Installing'
-            $computer.InstallErrors = 0
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Installing $installCount Updates, this may take some time."; State = 'Installing'; InstallErrors = 0 }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Installing $installCount Updates, this may take some time."; State = 'Installing'; InstallErrors = 0 }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         $remoteCred = $null
@@ -2167,10 +2300,32 @@ $InstallUpdates = {
             $progressText = "Installing $($p.Current)/$($p.Total): $($p.Title)"
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $Computer.Status = $progressText
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = $progressText }
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = $progressText }
+                }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
+        }
+        # EFFECT-BOUNDARY GUARD (G6): revalidate ownership immediately before installing.
+        $effectAuth = & $TestEffectAuthorizedScript -Computer $Computer
+        if (-not $effectAuth.Authorized) {
+            # Clean refusal - see the download guard above.
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                    $uiHash.Listview.Items.EditItem($Computer)
+                    $refusalResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    } else {
+                        Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    }
+                    $uiHash.Listview.Items.CommitEdit()
+                    if ($refusalResult.Applied) { $uiHash.Listview.Items.Refresh() }
+                })
+            } catch { }
+            return
         }
         $taskResult = & $InvokeRemoteTaskScript -ComputerName $Computer.computer -ScriptPath $ConfigPaths.InstallScript -Operation 'Install' -Credential $remoteCred -ProgressCallback $onProgress
         if (-not $taskResult.Success) {
@@ -2179,36 +2334,38 @@ $InstallUpdates = {
         $installErrors = $taskResult.Count
         $rebootRequired = $taskResult.RebootRequired
 
-        #Update status
+        #Update status - ONE patch: InstallErrors, RebootRequired and the display settle together.
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.InstallErrors = $installErrors
+            $installResultFields = @{ InstallErrors = $installErrors; RebootRequired = [bool]($rebootRequired -eq $True) }
             if ($rebootRequired -eq $True) {
-                $computer.Status = 'Install complete. Reboot required.'
-                $computer.State = 'RebootRequired'
-                $computer.RebootRequired = $True
+                $installResultFields['Status'] = 'Install complete. Reboot required.'
+                $installResultFields['State'] = 'RebootRequired'
             } else {
-                $computer.Status = 'Install complete.'
-                $computer.State = 'Complete'
-                $computer.RebootRequired = $False
+                $installResultFields['Status'] = 'Install complete.'
+                $installResultFields['State'] = 'Complete'
             }
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields $installResultFields
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields $installResultFields
+            }
+            # No imperative colouring - see the note at the first error path. Colour is projected.
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
     }
     Catch{
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Error occured: $($_.Exception.Message)"
-            $computer.UpdatesStatus = 'Error'
-            $computer.State = 'Error'
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)"; UpdatesStatus = 'Error'; State = 'Error' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)"; UpdatesStatus = 'Error'; State = 'Error' }
             }
+            # No imperative colouring - see the note at the first error path. Colour is projected.
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         #Cancel any remaining actions
@@ -2216,7 +2373,7 @@ $InstallUpdates = {
     }
 }
 
-# Note: the old $RemoveEntry block was removed here â€” PowerShell variable names are
+# Note: the old $RemoveEntry block was removed here - PowerShell variable names are
 # case-insensitive, so it silently shadowed the proper $removeEntry cleanup (defined
 # earlier) and leaked an open runspace on every computer removal.
 
@@ -2227,47 +2384,76 @@ $RemoveOfflineComputer = {
         #Update status
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($computer)
-            $computer.Status = 'Testing Connectivity.'
-            $computer.State = 'Connecting'
+            # Fenced multi-field write. -OperationId is passed so a RESUBMISSION (a row adopted over a
+            # settled display) is legal while a superseded writer is still refused by identity.
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $computer -OperationId $WuuOperationId -Fields @{ Status = 'Testing Connectivity.'; State = 'Connecting' }
+            } else {
+                Set-WuuComputerFencedFields -Row $computer -OperationId $WuuOperationId -Fields @{ Status = 'Testing Connectivity.'; State = 'Connecting' }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
         #Verify connectivity
         if(Test-Connection -Count 1 -ComputerName $computer.Computer -Quiet){
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($computer)
-                $computer.Status = 'Online.'
-                $computer.State = 'Connected'
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $computer -OperationId $WuuOperationId -Fields @{ Status = 'Online.'; State = 'Connected' }
+                } else {
+                    Set-WuuComputerFencedFields -Row $computer -OperationId $WuuOperationId -Fields @{ Status = 'Online.'; State = 'Connected' }
+                }
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
         }
         else{
-            #Remove unreachable computers
-            $updatesHash.Remove($computer.computer)
-            $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                $uiHash.Listview.Items.EditItem($computer)
-                # Check if clientObservable exists before trying to remove from it
-                if ($uiHash.clientObservable) {
-                    $uiHash.clientObservable.Remove($computer)
+            # SS12 CONNECTIVITY POLICY (review M-5). EVICTING ON A SINGLE LOST PACKET IS THE DEFECT: a
+            # host that blocks ICMP (the Windows Firewall default) or drops one reply was DELETED from
+            # the managed set and silently stopped being patched. Count CONSECUTIVE failures and evict
+            # only at the threshold. The eviction is done by the INJECTED twin - the module function
+            # `Remove-WuuComputerRow` is not resolvable here and `$global:stateStore` is not reachable in
+            # this runspace, so the old call silently no-opped while the view write landed.
+            $failureReason = 'ICMP ping failed'
+            $priorFailures = if ($computer.PSObject.Properties['ConnectivityFailures']) { [int]$computer.ConnectivityFailures } else { 0 }
+            $failureCount = $priorFailures + 1
+            $removalThreshold = if ($ConnectivityFailuresBeforeRemoval) { [int]$ConnectivityFailuresBeforeRemoval } else { 2 }
+            if ($failureCount -ge $removalThreshold) {
+                $removeResult = if ($RemoveComputerRowScript) { & $RemoveComputerRowScript -Computer $computer -WriterOperationId $WuuOperationId } else { @{ Applied = $false; Refused = $true; Reason = 'NoRemovalTwin' } }
+                if ($removeResult.Applied) {
+                    try { $updatesHash.Remove($computer.computer) } catch { }
+                    # The row is gone from the store; the projection drops its view row. No display write
+                    # is needed (or wanted) - the row no longer exists.
                 }
-                $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
-            })
+            }
+            else {
+                # KEEP the row. Mark it offline and RECORD the failure count so the next sweep can reach
+                # the threshold; the projection renders the colour from the Color field.
+                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                    $uiHash.Listview.Items.EditItem($computer)
+                    $keptFields = @{ Status = "Unreachable ($failureReason) - kept in the set; removal needs $removalThreshold consecutive failures."; State = 'Offline'; Color = 'Error'; ConnectivityFailures = $failureCount; LastConnectivityError = $failureReason }
+                    $keptResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $computer -OperationId $WuuOperationId -Fields $keptFields
+                    } else {
+                        Set-WuuComputerFencedFields -Row $computer -OperationId $WuuOperationId -Fields $keptFields
+                    }
+                    $uiHash.Listview.Items.CommitEdit()
+                    if ($keptResult.Applied) { $uiHash.Listview.Items.Refresh() }
+                })
+            }
         }
     }
     Catch{
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($computer)
-            $computer.Status = "Error occured: $($_.Exception.Message)"
-            $computer.State = 'Error'
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)"; State = 'Error'; Color = 'Error' }
+            } else {
+                Set-WuuComputerFencedFields -Row $computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)"; State = 'Error'; Color = 'Error' }
             }
+            # No imperative colouring: the Color field above IS the colour now (rendered by the projection).
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         #Cancel any remaining actions
@@ -2285,12 +2471,34 @@ $RestartComputer = {
         # Update status
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = 'Restarting... Waiting for computer to shutdown.'
-            $computer.State = 'Rebooting'
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Restarting... Waiting for computer to shutdown.'; State = 'Rebooting' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Restarting... Waiting for computer to shutdown.'; State = 'Rebooting' }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
+        # EFFECT-BOUNDARY GUARD (G6): revalidate ownership immediately before the reboot.
+        $effectAuth = & $TestEffectAuthorizedScript -Computer $Computer
+        if (-not $effectAuth.Authorized) {
+            # Clean refusal - see the download guard above. Returning here also skips the offline/online
+            # waits and the pool probe that follow, so a superseded operation performs no further work.
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                    $uiHash.Listview.Items.EditItem($Computer)
+                    $refusalResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    } else {
+                        Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    }
+                    $uiHash.Listview.Items.CommitEdit()
+                    if ($refusalResult.Applied) { $uiHash.Listview.Items.Refresh() }
+                })
+            } catch { }
+            return
+        }
         #Restart and wait until remote COM can be connected
         Restart-Computer $Computer.computer -Force
         $offlineWait = 0
@@ -2305,10 +2513,13 @@ $RestartComputer = {
         #Update status
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = 'Restarting... Waiting for computer to come online.'
-            $computer.State = 'Rebooting'
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Restarting... Waiting for computer to come online.'; State = 'Rebooting' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Restarting... Waiting for computer to come online.'; State = 'Rebooting' }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
 
         $onlineWait = 0
@@ -2345,10 +2556,13 @@ $RestartComputer = {
 
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = 'Restart complete. Computer is online.'
-            $computer.State = 'Connected'
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Restart complete. Computer is online.'; State = 'Connected' }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = 'Restart complete. Computer is online.'; State = 'Connected' }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
     }
     catch{
@@ -2359,7 +2573,9 @@ $RestartComputer = {
             # Runspace note: inside the worker runspace, module functions do not exist -
             # use the injected SetComputerTimeoutScript. The fallback covers direct UI usage.
             if ($SetComputerTimeoutScript) {
-                & $SetComputerTimeoutScript -Computer $Computer -Phase $timeoutPhase -TimeoutSec $OnlineWaitSeconds -Detail $errorMsg
+                $timeoutWrite = & $SetComputerTimeoutScript -Computer $Computer -Phase $timeoutPhase -TimeoutSec $OnlineWaitSeconds -Detail $errorMsg
+                if ($timeoutWrite.Refused) { return }
+                if (-not $timeoutWrite.Applied) { throw 'Timeout writer returned no applied/refused verdict' }
             } else {
                 Set-ComputerTimeout -Computer $Computer -Phase $timeoutPhase -TimeoutSec $OnlineWaitSeconds -Detail $errorMsg
             }
@@ -2367,15 +2583,14 @@ $RestartComputer = {
         } else {
             $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
                 $uiHash.Listview.Items.EditItem($Computer)
-                $computer.Status = "Error occured: $($_.Exception.Message)"
-                $computer.State = 'Error'
-                # Set background color to grey for errored entries
-                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-                if($listViewItem) {
-                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+                $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                    & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)"; State = 'Error' }
+                } else {
+                    Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Error occured: $($_.Exception.Message)"; State = 'Error' }
                 }
+                # No imperative colouring - the grid holds detached view rows; the Error State maps colour.
                 $uiHash.Listview.Items.CommitEdit()
-                $uiHash.Listview.Items.Refresh()
+                if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
             })
         }
 
@@ -2403,9 +2618,89 @@ $newRunspace.Open()
 $newRunspace.SessionStateProxy.SetVariable('jobCleanup',$jobCleanup)
 $newRunspace.SessionStateProxy.SetVariable('jobs',$jobs)
 $newRunspace.SessionStateProxy.SetVariable('uiHash',$uiHash)
+# The engine store, so the cleanup loop can RELEASE an operation's identity when its job settles
+# (Step B). Without this the loop could retire nothing and a settled row would keep
+# OpState='Running' for ever - which Test-WuuOperationStateInvariant reports as
+# "settled row still holds the runspace lock", and which would make the row permanently busy.
+$newRunspace.SessionStateProxy.SetVariable('stateStore',$global:stateStore)
 $newRunspace.SessionStateProxy.SetVariable('LogPath',$global:LogPath)
 $newRunspace.SessionStateProxy.SetVariable('LogLock',$global:LogLock)
 $newRunspace.SessionStateProxy.SetVariable('backgroundProcessing',$backgroundProcessing)
+# Fenced write for the 10-minute timeout paint. The cleanup loop cannot resolve the module writer, and
+# a raw assignment here would let a SUPERSEDED job overwrite a newly adopted operation's display - the
+# loop releases the identity immediately BEFORE it paints, so by the time it paints the row may already
+# belong to a new operation. The caller passes the identity it captured BEFORE the release, so a
+# mismatch refuses the write.
+#
+# DECOUPLED CALLER (T006.1/T008.2): the loop now resolves the row from the STORE BY KEY and writes it
+# here WITHOUT a Dispatcher hop. It used to marshal to the UI thread to find the ListView item - which
+# both (a) required the grid to hold the engine rows, and (b) blocked the cleanup loop whenever the UI
+# was busy/wedged. The row is authoritative in the store; the projection repaints the view.
+$newRunspace.SessionStateProxy.SetVariable('SetCleanupTimeoutScript', [scriptblock]::Create({
+    param(
+        [Parameter(Mandatory)][object]$Computer,
+        [Parameter(Mandatory)][string]$WriterOperationId
+    )
+    try {
+        foreach ($requiredProperty in @('Computer', 'State', 'Status', 'UpdatesStatus', 'TimeoutExpiresAt', 'TimeoutSource')) {
+            if (-not $Computer.PSObject.Properties[$requiredProperty]) { throw "Timeout row lacks required property: $requiredProperty" }
+        }
+        $rowId = ''
+        if ($Computer.PSObject.Properties['OperationId']) { $rowId = [string]$Computer.OperationId }
+
+        # IDENTITY, FIRST. A row that names a DIFFERENT operation is no longer this job's row; writing
+        # 'Timeout' to it would overwrite whatever the new operation is displaying.
+        if ($rowId -and $WriterOperationId -and ($rowId -cne $WriterOperationId)) { return @{ Applied = $false; Refused = $true; Reason = 'StaleOperation' } }
+        if ($Computer.PSObject.Properties['LastResetOperationId'] -and $Computer.LastResetOperationId) { return @{ Applied = $false; Refused = $true; Reason = 'ResetOperation' } }
+        # A settled row keeps its outcome: only Timeout may be (re)applied, so a Complete/Error row is not
+        # converted into a timeout by a later pass.
+        $cur = if ($Computer.PSObject.Properties['State']) { [string]$Computer.State } else { '' }
+        if ($cur -in @('Error', 'Complete')) { return @{ Applied = $false; Refused = $true; Reason = 'TerminalState' } }
+        # TAKE THE SHARED STATE GATE, exactly as the multi-field writer does, so this is one serialized
+        # write rather than a bespoke raw mutation. Bounded: skip this pass rather than block the loop.
+        $cleanupGateHeld = $false
+        try { if ($stateStore -and $stateStore.Gate) { $cleanupGateHeld = [System.Threading.Monitor]::TryEnter($stateStore.Gate, 5000) } } catch { $cleanupGateHeld = $false }
+        if ($cleanupGateHeld) {
+          try {
+            # Re-read the live row under the gate: the row may have been replaced/removed between the
+            # lookup and the write.
+            if ($stateStore) {
+                $live = $stateStore.ByName[[string]$Computer.Computer.ToLowerInvariant()]
+                if (-not [object]::ReferenceEquals($live, $Computer)) { return @{ Applied = $false; Refused = $true; Reason = 'RowReplacedOrRemoved' } }
+            }
+            if ($Computer.PSObject.Properties['Status'])         { $Computer.Status         = 'Operation timed out after 10 minutes' }
+            if ($Computer.PSObject.Properties['UpdatesStatus'])  { $Computer.UpdatesStatus  = 'Timeout' }
+            if ($Computer.PSObject.Properties['State'])          { $Computer.State          = 'Timeout' }
+            if ($Computer.PSObject.Properties['TimeoutSource'])  { $Computer.TimeoutSource  = 'JobTimeout' }
+            if ($Computer.PSObject.Properties['TimeoutExpiresAt']) { $Computer.TimeoutExpiresAt = $null }
+            if ($Computer.PSObject.Properties['Color'])          { $Computer.Color          = 'Timeout' }
+            if ($stateStore) { $stateStore.Touch() }
+            return @{ Applied = $true; Refused = $false; Reason = '' }
+          } finally { [System.Threading.Monitor]::Exit($stateStore.Gate) }
+        }
+        return @{ Applied = $false; Refused = $true; Reason = 'StateGateBusy' }
+    } catch { throw }
+}.ToString()))
+# PER-OPERATION DEADLINE (SS5). The cleanup loop cannot resolve the module helper
+# `Test-WuuOperationExpired`, so the rule is inlined here exactly as the other twins are. It uses the
+# deadline STAMPED ON THE ROW at submission (the value the operator was shown), falling back to the
+# runspace's start time plus the table's 'default' budget for a row that carries none (a legacy row, or
+# work not submitted through Start-UpdateCheckJob). Language constructs only - the cleanup runspace is
+# busy and a pipeline cmdlet would deadlock.
+$newRunspace.SessionStateProxy.SetVariable('OperationDefaultBudgetSeconds', $global:OperationTimeoutSeconds['default'])
+$newRunspace.SessionStateProxy.SetVariable('TestJobExpiredScript', [scriptblock]::Create({
+    param([string]$Computer, $StartTime)
+    $deadline = $null
+    if ($stateStore) {
+        $dRow = $stateStore.ByName[[string]$Computer.ToLowerInvariant()]
+        if ($dRow -and $dRow.PSObject.Properties['TimeoutExpiresAt'] -and $dRow.TimeoutExpiresAt) { $deadline = [DateTime]$dRow.TimeoutExpiresAt }
+    }
+    if (-not $deadline -and $StartTime -and $OperationDefaultBudgetSeconds) {
+        $deadline = ([DateTime]$StartTime).AddSeconds([int]$OperationDefaultBudgetSeconds)
+    }
+    if (-not $deadline) { return $false }
+    return ((Get-Date) -gt $deadline)
+}.ToString()))
 # Fault-tolerant log append for the cleanup loop (same lock+retry semantics
 # as WriteWuuLogEntry; takes pre-formatted lines - see Wuu.Logging.psm1)
 $newRunspace.SessionStateProxy.SetVariable('WriteLogFileScript', [scriptblock]::Create({
@@ -2446,6 +2741,43 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
 
                         $runspace.powershell.EndInvoke($runspace.Runspace) | Out-Null
 
+                        # RELEASE THE OPERATION IDENTITY (Step B). The end of a job is the moment the
+                        # row stops being busy and its identity retires, so the next operation can be
+                        # admitted without resetting the row.
+                        #
+                        # IDENTITY-GUARDED: only clear the id the row still HOLDS. A job that was
+                        # superseded (or whose row was re-submitted while this job drained) must not
+                        # clear its replacement's id - the same stale-writer rule the funnel enforces,
+                        # applied to the release path. Without the comparison, a late cleanup would
+                        # unlock a row that is legitimately running.
+                        try {
+                            if ($stateStore) {
+                                $relRow = $stateStore.ByName[[string]$runspace.Computer.ToLowerInvariant()]
+                                if ($relRow -and $relRow.PSObject.Properties['OperationId']) {
+                                    $relOwn = if ($runspace.OperationId) { [string]$runspace.OperationId } else { '' }
+                                    # TAKE THE SHARED STATE GATE (G3). The release is a PRODUCER of the same
+                                    # protected fields the funnel's atomic window guards, so it must
+                                    # participate or a worker twin could interleave between its
+                                    # validation and its write. Bounded: skip this pass rather than
+                                    # block the cleanup loop indefinitely; the next tick retries.
+                                    $relGateHeld = $false
+                                    try { if ($stateStore.Gate) { $relGateHeld = [System.Threading.Monitor]::TryEnter($stateStore.Gate, 5000) } } catch { $relGateHeld = $false }
+                                    if ($relGateHeld) {
+                                      try {
+                                        $relCur = [string]$relRow.OperationId
+                                        if ($relOwn -eq '' -or $relCur -eq '' -or $relCur -ceq $relOwn) {
+                                            if ($relRow.PSObject.Properties['OpState']) { $relRow.OpState = 'Idle' }
+                                            if ($relRow.PSObject.Properties['OperationId']) { $relRow.OperationId = '' }
+                                            if ($relRow.PSObject.Properties['OpStartedAt']) { $relRow.OpStartedAt = $null }
+                                            if ($relRow.PSObject.Properties['LastHeartbeatAt']) { $relRow.LastHeartbeatAt = $null }
+                                            $stateStore.Touch()
+                                        }
+                                      } finally { [System.Threading.Monitor]::Exit($stateStore.Gate) }
+                                    }
+                                }
+                            }
+                        } catch { }
+
                         $logEntry = "[$timestamp] [INFO] Successfully cleaned up job for computer: $($runspace.Computer)"
                         & $WriteLogFileScript $logEntry
                     } catch {
@@ -2460,47 +2792,77 @@ $jobCleanup.PowerShell = [PowerShell]::Create().AddScript({
                     $jobsToRemove += $runspace
                     
                 }
-                # Check for jobs that have been running too long (timeout after 10 minutes)
-                ElseIf ($runspace.StartTime -and ((Get-Date) - $runspace.StartTime).TotalMinutes -gt 10) {
+                # Check for jobs that have run past their DEADLINE. The deadline is the one stamped on
+                # the row at submission (per-op: AutoFlow 4 h, Restart 45 m, ...); the fallback for a row
+                # with none is its start time plus the table's default budget. This replaces a flat
+                # 10-minute cutoff that ignored the per-op table entirely.
+                ElseIf ((& $TestJobExpiredScript -Computer $runspace.Computer -StartTime $runspace.StartTime)) {
                     $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
                     $logEntry = "[$timestamp] [WARN] [$($runspace.Computer)] Job timeout detected for $($runspace.Computer) - running for $([math]::Round(((Get-Date) - $runspace.StartTime).TotalMinutes, 2)) minutes"
                     & $WriteLogFileScript $logEntry
 
                     $timedOutComputer = $runspace.Computer
+                    # CAPTURE THE IDENTITY BEFORE THE RELEASE BELOW. The release clears the row's
+                    # OperationId, so after it the row no longer names this job - and if a NEW operation
+                    # has since adopted it, the timeout paint must be refused rather than overwrite the
+                    # new operation's display.
+                    $timedOutOwnerId = if ($runspace.OperationId) { [string]$runspace.OperationId } else { '' }
                     try { $runspace.powershell.Stop() } catch { $null = $_ }
                     try { $runspace.powershell.dispose() } catch { $null = $_ }
                     $runspace.Runspace = $null
                     $runspace.powershell = $null
                     $jobsToRemove += $runspace
+
+                    # RELEASE THE IDENTITY ON TIMEOUT TOO (Step B). A timeout is a SETTLED outcome - the
+                    # row is recoverable and must not stay busy, or the operator could never retry it.
+                    # Same identity guard as the completion path above.
+                    try {
+                        if ($stateStore) {
+                            $tRow = $stateStore.ByName[[string]$timedOutComputer.ToLowerInvariant()]
+                            if ($tRow -and $tRow.PSObject.Properties['OperationId']) {
+                                $tOwn = if ($runspace.OperationId) { [string]$runspace.OperationId } else { '' }
+                                # TAKE THE SHARED STATE GATE (G3) - see the completion path above.
+                                $tGateHeld = $false
+                                try { if ($stateStore.Gate) { $tGateHeld = [System.Threading.Monitor]::TryEnter($stateStore.Gate, 5000) } } catch { $tGateHeld = $false }
+                                if ($tGateHeld) {
+                                  try {
+                                    $tCur = [string]$tRow.OperationId
+                                    if ($tOwn -eq '' -or $tCur -eq '' -or $tCur -ceq $tOwn) {
+                                        if ($tRow.PSObject.Properties['OpState']) { $tRow.OpState = 'Idle' }
+                                        if ($tRow.PSObject.Properties['OperationId']) { $tRow.OperationId = '' }
+                                        if ($tRow.PSObject.Properties['OpStartedAt']) { $tRow.OpStartedAt = $null }
+                                        if ($tRow.PSObject.Properties['LastHeartbeatAt']) { $tRow.LastHeartbeatAt = $null }
+                                        $stateStore.Touch()
+                                    }
+                                  } finally { [System.Threading.Monitor]::Exit($stateStore.Gate) }
+                                }
+                            }
+                        }
+                    } catch { }
                     
 
-                    # Update computer status to show timeout (item lookup must happen on the UI thread)
-                    # Note: language constructs only inside the action - pipeline cmdlets (Where-Object)
-                    # would bind to this busy cleanup runspace and deadlock the UI thread.
+                    # Paint the timeout on the ENGINE row, resolved BY KEY from the store - NO Dispatcher.
+                    # The cleanup loop used to marshal to the UI thread to find the ListView item, which
+                    # blocked this loop whenever the UI was busy or wedged, and required the grid to hold
+                    # the engine rows. The store is authoritative; the projection repaints the view.
+                    # Language constructs only (a foreach/if), so no pipeline cmdlet binds to this busy
+                    # cleanup runspace's engine.
                     try {
-                        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-                            $computer = $null
-                            foreach ($entry in $uiHash.Listview.Items) {
-                                if ($entry.Computer -eq $timedOutComputer) { $computer = $entry; break }
+                        $timeoutRow = $null
+                        if ($stateStore) { $timeoutRow = $stateStore.ByName[[string]$timedOutComputer.ToLowerInvariant()] }
+                        if ($timeoutRow) {
+                            # Fenced write, gated by the identity captured BEFORE the release. A refusal
+                            # (a superseded pass) is expected and left silent - the row belongs to a newer
+                            # operation and its display must not be clobbered. No colour is set
+                            # imperatively: the projection renders the engine row's Color field.
+                            if ($SetCleanupTimeoutScript) {
+                                $null = & $SetCleanupTimeoutScript -Computer $timeoutRow -WriterOperationId $timedOutOwnerId
                             }
-                            if ($computer) {
-                                $uiHash.Listview.Items.EditItem($computer)
-                                $computer.Status = "Operation timed out after 10 minutes"
-                                $computer.UpdatesStatus = 'Timeout'
-                                $computer.State = 'Timeout'
-                                # Timeout is recoverable - yellow, matching Set-ComputerTimeout
-                                $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($computer)
-                                if($listViewItem) {
-                                    $listViewItem.Background = [System.Windows.Media.Brushes]::LightYellow
-                                }
-                                $uiHash.Listview.Items.CommitEdit()
-                                $uiHash.Listview.Items.Refresh()
-                            }
-                        })
+                        }
                     } catch {
-                        # If UI update fails, just log it
+                        # If the write fails, just log it
                         $timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss.fff'
-                        $logEntry = "[$timestamp] [WARN] Timeout UI update skipped for ${timedOutComputer}: $($_.Exception.Message)"
+                        $logEntry = "[$timestamp] [WARN] Timeout write skipped for ${timedOutComputer}: $($_.Exception.Message)"
                         & $WriteLogFileScript $logEntry
                     }
                 }
@@ -2888,12 +3250,43 @@ $eventWindowClose = { #Runs when WUU closes
     #Halt job processing
     $jobCleanup.Flag = $False
 
-    #Stop all runspaces
-    $jobCleanup.PowerShell.Dispose()
-    
+    #Stop the job-cleanup runspace. BOUNDED (T008.2): its pipeline may be wedged in an uninterruptible
+    #native call, and an unbounded Dispose would hang the window close. Abandoned on timeout.
+    try {
+        if ($jobCleanup.PowerShell) {
+            $null = Close-WuuBoundedTeardown -ArgumentList @($jobCleanup.PowerShell) -TimeoutSeconds 5 -ScriptBlock {
+                param($p)
+                if ($p) { try { $p.Stop() } catch { } }
+                if ($p) { try { $p.Dispose() } catch { } }
+            }
+        }
+    } catch { }
+
+    # TEAR DOWN THE SHARED WORKER POOL. ORDER MATTERS: the per-computer runspaces may still be issuing
+    # pooled probes and those payloads captured the pool object at creation, so the pool must be closed
+    # AFTER the payloads stop - never before, or every in-flight pooled probe aborts silently. The
+    # payloads are stopped in the tail cleanup, so close the pool AFTER the tail's job/runspace teardown
+    # by NOT closing it here. Instead we only close it here when there are no live workers to strand; the
+    # tail finally owns the authoritative, ordered teardown.
+    $liveWorkerRows = 0
+    try {
+        # SOURCED FROM THE ENGINE STORE (T006.1): the ListView holds detached view rows that carry no
+        # Runspace, so counting them would always report zero live workers and tear the pool down early.
+        if ($global:stateStore) {
+            foreach ($workerRow in @($global:stateStore.Rows)) {
+                if ($workerRow -and $workerRow.PSObject.Properties['Runspace'] -and $workerRow.Runspace -and $workerRow.Runspace.RunspaceStateInfo.State -eq 'Opened') { $liveWorkerRows++ }
+            }
+        }
+    } catch { }
+    if ($liveWorkerRows -eq 0) {
+        # No per-computer payload can be stranded, so it is safe to tear the pool down now. If workers
+        # ARE live, the tail cleanup (guaranteed after ShowDialog returns) performs the ordered teardown.
+        try { Close-WuuWorkerPool -TimeoutSeconds 5 | Out-Null } catch { }
+    }
+
     #Cleanup
     [gc]::Collect()
-    [gc]::WaitForPendingFinalizers()    
+    [gc]::WaitForPendingFinalizers()
 }
 
 #endregion Window and UI Events
@@ -3499,29 +3892,28 @@ $eventAddFile = { #Add computers from CSV or TXT file with advanced options
 
 #region Update Operations
 $eventGetUpdates = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    # Resolve the selection to ENGINE rows by key (T006.1); a view snapshot would go stale the moment
+    # the projection is decoupled.
+    Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore | ForEach-Object {
         # Manual check resets the Phase-E auto-retry budget and cancels any scheduled retry
         if ($_.PSObject.Properties['RetryCount']) { $_.RetryCount = 0; $_.RetryAt = $null }
         if (-not $_.Runspace) {
-            # Item was never started (phase-gated or loaded from config): use the full startup path
+            # Item was never started (phase-gated or loaded from config): clear the not-yet-started
+            # marker so admission is not blocked by it, then use the full startup path.
             if ($_.PSObject.Properties['Pending']) { $_.Pending = $false }
-            [void](Start-UpdateCheckJob -ComputerItem $_)
+            [void](Start-UpdateCheckJob -ComputerItem $_ -Op 'Check')
             return
         }
-        $temp = New-Object PSObject -Property @{
-            PowerShell = $null
-            Runspace = $null
-            StartTime = Get-Date
-            Computer = $_.Computer
+        # Reused worker: submit through the SAME admitted path rather than composing a second
+        # BeginInvoke here. An unclaimed submission would run with no operation identity, so every
+        # write it made would be "unattributed" and therefore permitted by the fence.
+        if (-not (Start-UpdateCheckJob -ComputerItem $_ -Op 'Check')) {
+            Write-InfoLog "Manual check for $($_.Computer) was not admitted (busy or at the concurrency cap); the running/queued operation continues - click again once the row is idle"
         }
-        $temp.PowerShell = [powershell]::Create().AddScript($GetUpdates).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
     }
 }
 $eventDownloadUpdates = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -3545,17 +3937,15 @@ $eventDownloadUpdates = {
             return
         }
 
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($DownloadUpdates).AddArgument($_)
-        # Disable SetUpdatesStatus to prevent hanging - status updates are handled within DownloadUpdates
-        # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        # Submit through the single admitted path (claim + cap under the submission lock, before
+        # BeginInvoke). Composing a BeginInvoke here would bypass ownership and the cap.
+        if (-not (Start-UpdateCheckJob -ComputerItem $_ -Op 'Download')) {
+            Write-InfoLog "Download submission for $($_.Computer) was not admitted (busy or at the concurrency cap)"
+        }
     }
 }
 $eventInstallUpdates = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -3586,21 +3976,29 @@ $eventInstallUpdates = {
             return
         }
 
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($InstallUpdates).AddArgument($_)
-        $temp.PowerShell.AddScript($RestartComputer).AddArgument($_).AddArgument($true)
-        $temp.PowerShell.AddScript($GetUpdates).AddArgument($_)
-        # Disable SetUpdatesStatus to prevent hanging - status updates are handled within GetUpdates
-        # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        # Submit through the single admitted path (claim + cap under the submission lock, before
+        # BeginInvoke). The built-in 'InstallAndRecheck' chain composes install -> restart -> recheck
+        # in ONE pipeline, exactly as this handler used to.
+        if (-not (Start-UpdateCheckJob -ComputerItem $_ -Op 'InstallAndRecheck')) {
+            Write-InfoLog "Install submission for $($_.Computer) was not admitted (busy or at the concurrency cap)"
+        }
     }
 }
 
 #region System Management
 $eventRemoveOfflineComputer = {
-    $uiHash.Listview.Items | ForEach-Object {
+    # This is deliberately an ALL-ROWS sweep: "remove the offline computers" is a fleet query, and a
+    # busy row is not an offline row, so a refused submission is not a lost action - the busy row's
+    # own running operation ends with a status write. A refusal summary keeps the sweep observable
+    # (EnableDebugLogging is off by default, so a per-row InfoLog alone would be invisible).
+    $offlineRefused = New-Object System.Collections.Generic.List[string]
+    # SWEEP THE ENGINE STORE, NOT THE VIEW (T006.1). The ListView holds detached view rows that carry no
+    # `Runspace`, so feeding them to Start-UpdateCheckJob would create a runspace ON THE VIEW OBJECT and
+    # then be refused by the live-row check - the whole sweep would be inert AND leak one runspace per
+    # row (the shutdown/load sweeps only visit the STORE, so nothing would ever close them).
+    $sweepRows = @()
+    try { if ($global:stateStore) { $sweepRows = @($global:stateStore.Rows) } } catch { }
+    $sweepRows | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -3608,15 +4006,20 @@ $eventRemoveOfflineComputer = {
                 return
             }
         }
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($RemoveOfflineComputer).AddArgument($_)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        # Lifecycle op: route through the admitted path with an explicit payload so it is claimed
+        # and capability-checked like every other engine submission.
+        if (-not (Start-UpdateCheckJob -ComputerItem $_ -Op 'RemoveOffline' -Payload @(
+                    @{ Script = $RemoveOfflineComputer; Arguments = @($_) }))) {
+            $offlineRefused.Add($_.Computer) | Out-Null
+        }
+    }
+    if ($offlineRefused.Count -gt 0) {
+        Update-StatusBackground "Connectivity check not started for $($offlineRefused.Count) computer(s) (busy or at the concurrency cap): $($offlineRefused -join ', ')"
     }
 }
 $eventRestartComputer = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    $restartRefused = New-Object System.Collections.Generic.List[string]
+    Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -3624,14 +4027,17 @@ $eventRestartComputer = {
                 return
             }
         }
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($RestartComputer).AddArgument($_).AddArgument($false)
-        $temp.PowerShell.AddScript($GetUpdates).AddArgument($_)
-        # Disable SetUpdatesStatus to prevent hanging - status updates are handled within GetUpdates
-        # $temp.PowerShell.AddScript($SetUpdatesStatus).AddArgument($_)		
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        # Lifecycle op: restart, then recheck, in ONE admitted pipeline. $false (not the auto-install
+        # $true) is faithful to the manual restart's previous behaviour: afterInstall=$true would skip
+        # the restart entirely unless RebootRequired and the auto-reboot setting say otherwise.
+        if (-not (Start-UpdateCheckJob -ComputerItem $_ -Op 'Restart' -Payload @(
+                    @{ Script = $RestartComputer; Arguments = @($_, $false) },
+                    @{ Script = $GetUpdates;     Arguments = @($_) }))) {
+            $restartRefused.Add($_.Computer) | Out-Null
+        }
+    }
+    if ($restartRefused.Count -gt 0) {
+        Update-StatusBackground "Restart not started for $($restartRefused.Count) computer(s) (busy or at the concurrency cap): $($restartRefused -join ', ')"
     }
 }
 #endregion
@@ -3757,7 +4163,7 @@ $eventKeyDown = {
             }
         }
     }
-    ElseIf ($_.Key -eq 'Delete') {&$removeEntry @($uiHash.Listview.SelectedItems)}
+    ElseIf ($_.Key -eq 'Delete') {&$removeEntry @(Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore)}
 }
 $eventRightClick = {
     try {
@@ -3947,54 +4353,100 @@ $eventLoadConfig = {
 
         if ($loadResult.Success) {
             $loadedComputers = $loadResult.Config.Computers
-            
-            # Clear current items from the ObservableCollection
-            $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                if ($uiHash.clientObservable) {
-                    $uiHash.clientObservable.Clear()
-                }
-            })
 
-            # Add loaded items to the ObservableCollection
-            ForEach ($compData in $loadedComputers) {
-                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
-                    if ($null -eq $uiHash.clientObservable) {
-                        $uiHash.clientObservable = New-Object System.Collections.ObjectModel.ObservableCollection[object]
-                        $uiHash.ListView.ItemsSource = $uiHash.clientObservable
+            # STAGE every row FIRST - no UI, no store. A load is a WHOLE-INVENTORY replace, so it must
+            # commit atomically: a failure part-way through must leave the existing fleet untouched
+            # rather than half-cleared. Staging outside the dispatcher also replaces N UI ticks with
+            # ONE, which matters on a large list.
+            $stagedRows = New-Object System.Collections.ArrayList
+            $stagingFailures = 0
+            foreach ($compData in $loadedComputers) {
+                try {
+                    # Only load computer name and phase - all other data starts fresh
+                    $computerObject = New-Object PSObject -Property @{
+                        State = 'Queued'
+                        StateTimestamp = Get-Date
+                        StateSource = 'BulkAdd'
+                        Computer = if ($compData.Computer) { $compData.Computer } else { "Unknown" }
+                        Phase = if ($compData.Phase) { $compData.Phase } else { "Phase 1" }
+                        Available = 0  # Start fresh
+                        Downloaded = 0  # Start fresh
+                        InstallErrors = 0  # Start fresh
+                        Status = "Loaded from config. Right-click > Check For Updates to refresh status."
+                        RebootRequired = $false  # Start fresh
+                        UpdatesStatus = "Unknown"  # Start fresh
+                        Runspace = $null
+                        Pending = $false  # Loaded computers wait for a manual Check For Updates
+                        TimeoutExpiresAt = $null
+                        TimeoutSource = ''
+                        RetryCount = 0
+                        RetryAt = $null
                     }
-                    try {
-                        # Only load computer name and phase - all other data starts fresh
-                        $computerObject = New-Object PSObject -Property @{
-                            State = 'Queued'
-                            StateTimestamp = Get-Date
-                            StateSource = 'BulkAdd'
-                            Computer = if ($compData.Computer) { $compData.Computer } else { "Unknown" }
-                            Phase = if ($compData.Phase) { $compData.Phase } else { "Phase 1" }
-                            Available = 0  # Start fresh
-                            Downloaded = 0  # Start fresh
-                            InstallErrors = 0  # Start fresh
-                            Status = "Loaded from config. Right-click > Check For Updates to refresh status."
-                            RebootRequired = $false  # Start fresh
-                            UpdatesStatus = "Unknown"  # Start fresh
-                            Runspace = $null
-                            Pending = $false  # Loaded computers wait for a manual Check For Updates
-                            TimeoutExpiresAt = $null
-                            TimeoutSource = ''
-                            RetryCount = 0
-                            RetryAt = $null
-                        }
-                        
-                        $uiHash.clientObservable.Add($computerObject)
-                        Write-InfoLog "Successfully loaded computer: $($computerObject.Computer)"
-                    } catch {
-                        Write-ErrorLog "Failed to add computer: $($compData.Computer). Error: $($_.Exception.Message)"
-                        Update-Status "Error adding $($compData.Computer): $($_.Exception.Message)"
-                    }
-                })
+                    # Backfill the engine contract BEFORE staging, or the fence/colour/heartbeat writers
+                    # would have no property to write on the loaded rows.
+                    Set-WuuRowEngineDefaults -Row $computerObject | Out-Null
+                    $stagedRows.Add($computerObject) | Out-Null
+                } catch {
+                    $stagingFailures++
+                    Write-ErrorLog "Failed to stage loaded computer '$($compData.Computer)': $($_.Exception.Message)"
+                }
             }
-            
+
+            if ($stagingFailures -gt 0) {
+                # ALL-OR-NOTHING. A partial stage means the loaded document is not faithfully
+                # representable, and committing the subset would silently DROP computers (and discard
+                # their live runspace/operation state). Leave the existing fleet untouched and tell the
+                # operator plainly - the durable log is disabled by default.
+                Update-Status "Load aborted: $stagingFailures of $($loadedComputers.Count) entr$(if ($stagingFailures -eq 1) { 'y' } else { 'ies' }) could not be staged. The existing computer list was left unchanged."
+            } else {
+            # COMMIT AS ONE RECOVERABLE TRANSACTION. The engine store is replaced in ONE atomic step
+            # (rows + lookup together, one revision bump, under the shared state gate); the view mirror
+            # is then replaced in ONE dispatcher tick with the SAME row objects. If the VIEW commit
+            # fails (e.g. the window is closing), the STORE commit is ROLLED BACK, or the authoritative
+            # store and the visible fleet would disagree - the app would run the new fleet while the
+            # operator saw the old one.
+            $previousRows = @($global:stateStore.Rows)
+            Set-WuuComputerRows -Store $global:stateStore -Rows @($stagedRows) | Out-Null
+            # REPLACE THE VIEW FROM THE ENGINE STORE. The grid holds VIEW rows; this commit refreshes
+            # them from the SAME staged engine rows (one revision bump, one reconcile) rather than
+            # adding the engine rows themselves. If this throws (window closing) the store commit below
+            # is rolled back so the operator and the engine do not diverge.
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
+                    Update-WuuProjection -Force
+                })
+            } catch {
+                # Roll the engine store back so it matches what the operator can still see.
+                Set-WuuComputerRows -Store $global:stateStore -Rows $previousRows | Out-Null
+                Update-Status "Load failed while updating the view; the existing computer list was restored. $($_.Exception.Message)"
+                throw
+            }
+            foreach ($stagedRow in $stagedRows) { Write-InfoLog "Successfully loaded computer: $($stagedRow.Computer)" }
+
+            # RECLAIM THE OUTGOING RUNSPACES. Rows dropped by the replacement are unreachable from both
+            # collections, so neither the shutdown sweep nor the cleanup loop will ever close them - an
+            # idle reusable runspace per dropped row would leak. Skip any computer a live job still owns
+            # in $jobs: that job's own cleanup path retires it.
+            $liveJobComputers = @{}
+            foreach ($jobEntry in @($jobs)) {
+                if ($jobEntry -and $jobEntry.Computer) { $liveJobComputers[[string]$jobEntry.Computer.ToLowerInvariant()] = $true }
+            }
+            foreach ($previousRow in $previousRows) {
+                if ($null -eq $previousRow) { continue }
+                $previousKey = [string]$previousRow.Computer
+                if (-not $previousKey) { continue }
+                if ($liveJobComputers.ContainsKey($previousKey.ToLowerInvariant())) { continue }
+                $previousRunspace = $null
+                if ($previousRow.PSObject.Properties['Runspace']) { $previousRunspace = $previousRow.Runspace }
+                if (-not $previousRunspace) { continue }
+                try { $previousRunspace.Close() } catch { }
+                try { $previousRunspace.Dispose() } catch { }
+                if ($previousRow.PSObject.Properties['Runspace']) { $previousRow.Runspace = $null }
+            }
+
             # Worker runspaces are created on demand (New-ComputerRunspace) when an operation is requested
             Update-Status "Encrypted computer list loaded from $configPath"
+            }
         } else {
             # Show error dialog for load failure (likely wrong password)
             $errorMessage = $loadResult.Error
@@ -4159,22 +4611,24 @@ $eventShowUpdateHistory = {
             throw "Failed to retrieve update history: $($comResult.Error)"
         }
     } Catch{
-        $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
-            $uiHash.Listview.Items.EditItem($computer)
-            $computer.Status = "Error Occured: $($_.exception.Message)"
-            $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
-        })
+        # DECOUPLED (T006.1): `$computer` here is a VIEW row (read out of SelectedItems), so a direct
+        # write would be lost. Resolve the ENGINE row by key and write it through the fenced writer; the
+        # projection repaints the view.
+        $errorRow = $null
+        try { if ($computer) { $errorRow = $global:stateStore.ByName[[string]$computer.Computer.ToLowerInvariant()] } } catch { $errorRow = $null }
+        if ($errorRow) {
+            try { Set-WuuComputerFencedFields -Row $errorRow -Fields @{ Status = "Error Occured: $($_.exception.Message)" } -Store $global:stateStore | Out-Null } catch { }
+        }
     }
 }
 $eventViewUpdateLog = {
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore | ForEach-Object {
         &"\\$($_.computer)\c$\windows\windowsupdate.log"
     }
 }
 $eventWUServiceAction = {
     Param ($Action)
-    $uiHash.Listview.SelectedItems | ForEach-Object {
+    Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore | ForEach-Object {
         if (-not $_.Runspace) {
             $item = $_
             try { $item.Runspace = New-ComputerRunspace -ComputerItem $item } catch {
@@ -4182,11 +4636,11 @@ $eventWUServiceAction = {
                 return
             }
         }
-        $temp = "" | Select-Object PowerShell,Runspace
-        $temp.PowerShell = [powershell]::Create().AddScript($WUServiceAction).AddArgument($_).AddArgument($Action)
-        $temp.PowerShell.Runspace = $_.Runspace
-        $temp.Runspace = $temp.PowerShell.BeginInvoke()
-        $jobs.Add($temp) | Out-Null
+        # Lifecycle op: route through the admitted path with an explicit payload.
+        if (-not (Start-UpdateCheckJob -ComputerItem $_ -Op 'ServiceAction' -Payload @(
+                    @{ Script = $WUServiceAction; Arguments = @($_, $Action) }))) {
+            Write-InfoLog "Windows Update service action '$Action' for $($_.Computer) was not admitted (busy or at the concurrency cap)"
+        }
     }
 }
 
@@ -4202,16 +4656,42 @@ $WUServiceAction = {
         # Update status
         $uiHash.ListView.Dispatcher.Invoke('Normal',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = switch ($Action) {
+            $serviceStatusText = switch ($Action) {
                 'Start'   { 'Starting Windows Update Service...' }
                 'Stop'    { 'Stopping Windows Update Service...' }
                 'Restart' { 'Restarting Windows Update Service...' }
                 default   { "${Action}ing Windows Update Service..." }
             }
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = $serviceStatusText }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = $serviceStatusText }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
         
+        # EFFECT-BOUNDARY GUARD (G6): revalidate ownership immediately before the service state change.
+        $effectAuth = & $TestEffectAuthorizedScript -Computer $Computer
+        if (-not $effectAuth.Authorized) {
+            # Route the refusal notice through the fenced writer: if another operation now owns the row
+            # this write is ITSELF refused, so a superseded operation cannot clobber the new owner's
+            # display. The reason is also logged for the case where nothing is displayed.
+            try { & $WriteDebugLogScript -Message "Service action '$Action' refused on $($Computer.Computer): $($effectAuth.Reason)" -Level 'WARN' -Computer $Computer.Computer } catch { }
+            try {
+                $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
+                    $uiHash.Listview.Items.EditItem($Computer)
+                    $refusalResult = if ($SetComputerFencedFieldsScript) {
+                        & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    } else {
+                        Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Refused: $($effectAuth.Reason) - this operation no longer owns the computer." }
+                    }
+                    $uiHash.Listview.Items.CommitEdit()
+                    if ($refusalResult.Applied) { $uiHash.Listview.Items.Refresh() }
+                })
+            } catch { }
+            return
+        }
         # Perform the service action with timeout protection (avoids hangs)
         if ($Computer.Computer -eq 'localhost' -or $Computer.Computer -eq $env:COMPUTERNAME) {
             $service = Get-Service -Name 'wuauserv' -ErrorAction Stop
@@ -4256,9 +4736,13 @@ $WUServiceAction = {
         # Update status with result
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = $result
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = $result }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = $result }
+            }
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
         
         try { & $WriteDebugLogScript -Message "Windows Update service action '$Action' completed successfully on $($Computer.Computer)" -Level 'SUCCESS' -Computer $Computer.Computer } catch { }
@@ -4268,14 +4752,14 @@ $WUServiceAction = {
         
         $uiHash.ListView.Dispatcher.Invoke('Background',[action]{
             $uiHash.Listview.Items.EditItem($Computer)
-            $computer.Status = "Service $Action failed: $($_.Exception.Message)"
-            # Set background color to grey for errored entries
-            $listViewItem = $uiHash.Listview.ItemContainerGenerator.ContainerFromItem($Computer)
-            if($listViewItem) {
-                $listViewItem.Background = [System.Windows.Media.Brushes]::LightGray
+            $fieldsResult = if ($SetComputerFencedFieldsScript) {
+                & $SetComputerFencedFieldsScript -Computer $Computer -OperationId $WuuOperationId -Fields @{ Status = "Service $Action failed: $($_.Exception.Message)" }
+            } else {
+                Set-WuuComputerFencedFields -Row $Computer -OperationId $WuuOperationId -Fields @{ Status = "Service $Action failed: $($_.Exception.Message)" }
             }
+            # No imperative colouring - the grid holds detached view rows; colour is projected.
             $uiHash.Listview.Items.CommitEdit()
-            $uiHash.Listview.Items.Refresh()
+            if ($fieldsResult.Applied) { $uiHash.Listview.Items.Refresh() }
         })
     }
 }
@@ -4435,9 +4919,10 @@ $uiHash.RemoveComputerContext.Add_Click({
             return
         }
         
-        # Call removeEntry with validated selection
-        &$removeEntry @($uiHash.Listview.SelectedItems)
-        Write-InfoLog "Removed $($uiHash.Listview.SelectedItems.Count) computers via context menu"
+        # Call removeEntry with the AUTHORITATIVE engine rows (resolved by key), not view objects.
+        $removeRows = Resolve-WuuSelectedRows -ListView $uiHash.Listview -Store $global:stateStore
+        &$removeEntry @($removeRows)
+        Write-InfoLog "Removed $($removeRows.Count) computers via context menu"
     } catch {
         $errorMsg = $_.Exception.Message
         Write-ErrorLog "Error in RemoveComputerContext click: $errorMsg"
@@ -4474,8 +4959,22 @@ $uiHash.CopyCellContext.Add_Click($eventCopyCellContent) #Copy Cell Content
 # Without this, Start-PendingUpdateCheck silently no-ops on a null context and items
 # stay stuck at "Initializing...". Must run AFTER the payload closures exist and BEFORE
 # the first timer tick.
+#
+# StateStore (T006/T007 step A). The engine store is created HERE and handed to the job layer.
+#
+# Why this is 'step A' and additive-only: measured, the engine was COMPLETE but UNUSED - nothing in
+# src/ called New-WuuStateStore, Add-WuuComputerRow or Update-WuuOperationState, and no runspace
+# received a store. Production kept its state in ListView.Items. This step makes the store exist and
+# be truthful by MIRRORING row add/remove from the ListView; it does not move any read or write off the
+# ListView, so behaviour is unchanged and the existing suites must stay green.
+#
+# The store is the same object shared with workers, so it must be created once and passed by reference.
+# A second store (e.g. created inside a worker) would silently fence nothing: the identity rule compares
+# rows against ids, and two stores means two sets of rows.
+$global:stateStore = New-WuuStateStore
 $wuuContext = @{
     UiHash                     = $global:uiHash
+    StateStore                 = $global:stateStore
     Jobs                       = $global:jobs
     UpdatesHash                = $global:updatesHash
     PerformanceHash            = $global:performanceHash
@@ -4513,11 +5012,27 @@ Initialize-WuuWindowsUpdateContext -Context $wuuContext
 # Starts pending update checks from the UI thread without ever blocking it
 $uiHash.JobTimer = New-Object System.Windows.Threading.DispatcherTimer
 $uiHash.JobTimer.Interval = [TimeSpan]::FromSeconds(1)
+# REPAINT TICK (T008.2 groundwork). Some writers only signal a redraw via $stateStore.Touch() (the
+# timeout twins, the cleanup loop, the funnel) and do NOT sit inside a Dispatcher envelope, so their
+# change never reached the grid - a row could sit on stale text indefinitely. Nothing consumed
+# Revision before this. The tick compares the store's Revision with the last one rendered and refreshes
+# the view only when it moved, so a Touch-only write now repaints and an idle fleet costs nothing.
+$script:lastRenderedRevision = -1
 $uiHash.JobTimer.Add_Tick({
     try {
         Start-PendingUpdateCheck
     } catch {
         Write-ErrorLog "Job scheduler tick failed: $($_.Exception.Message)"
+    }
+    try {
+        # PROJECT, do not merely Refresh. The ListView now holds INDEPENDENT view rows, so an engine
+        # write (a fenced payload write, a timeout twin, the cleanup loop) reaches the grid only when
+        # this reconcile copies it into the view row. Update-WuuProjection is revision-gated, so an
+        # idle fleet costs one comparison and a Touch-only write repaints exactly once.
+        Update-WuuProjection
+    } catch {
+        # A repaint failure must never kill the scheduler tick.
+        Write-WarningLog "Repaint tick failed: $($_.Exception.Message)"
     }
 })
 $uiHash.JobTimer.Start()
@@ -4649,35 +5164,46 @@ exit
         }
     }
     
-    # Stop and dispose all running jobs
+    # Stop and dispose all running jobs. BOUNDED (T008.2): .Stop()/.Dispose() join the payload thread, and
+    # a payload wedged in an uninterruptible native call (a black-holed DCOM/RPC probe) never returns, so
+    # an unbounded teardown would hang application exit. Close-WuuBoundedTeardown abandons a wedged join.
     if ($jobs) {
         Write-InfoLog "Cleaning up $($jobs.Count) background jobs"
+        $jobPowerShells = @()
         foreach ($job in $jobs) {
-            try {
-                if ($job.PowerShell) {
-                    $job.PowerShell.Stop()
-                    $job.PowerShell.Dispose()
-                }
-            } catch {
-                Write-WarningLog "Failed to cleanup job: $($_.Exception.Message)"
+            try { if ($job -and $job.PowerShell) { $jobPowerShells += $job.PowerShell } } catch { }
+        }
+        if ($jobPowerShells.Count -gt 0) {
+            $ok = Close-WuuBoundedTeardown -ArgumentList (,$jobPowerShells) -TimeoutSeconds 10 -ScriptBlock {
+                param($list)
+                foreach ($p in $list) { try { $p.Stop() } catch { } }
+                foreach ($p in $list) { try { $p.Dispose() } catch { } }
             }
+            if (-not $ok) { Write-WarningLog "Job teardown timed out; a payload may still be running" }
         }
         $jobs.Clear()
     }
     
-    # Close and dispose all runspaces
-    if ($uiHash.Listview.Items) {
-        Write-InfoLog "Cleaning up computer runspaces"
-        foreach ($computer in $uiHash.Listview.Items) {
-            if ($computer.Runspace) {
-                try {
-                    $computer.Runspace.Close()
-                    $computer.Runspace.Dispose()
-                } catch {
-                    Write-WarningLog "Failed to cleanup runspace for $($computer.Computer): $($_.Exception.Message)"
-                }
-            }
+    # Close and dispose all runspaces. SOURCED FROM THE ENGINE STORE (T006.1): the ListView now holds
+    # detached VIEW rows that carry no Runspace, so iterating it would leak every per-computer runspace.
+    # BOUNDED (T008.2) for the same reason as the jobs above.
+    $runspacesToClose = @()
+    try {
+        foreach ($engineRow in @($global:stateStore.Rows)) {
+            if ($null -eq $engineRow) { continue }
+            $rs = $null
+            if ($engineRow.PSObject.Properties['Runspace']) { $rs = $engineRow.Runspace }
+            if ($rs) { $runspacesToClose += $rs; $engineRow.Runspace = $null }
         }
+    } catch { }
+    if ($runspacesToClose.Count -gt 0) {
+        Write-InfoLog "Cleaning up $($runspacesToClose.Count) computer runspace(s)"
+        $ok = Close-WuuBoundedTeardown -ArgumentList (,$runspacesToClose) -TimeoutSeconds 10 -ScriptBlock {
+            param($list)
+            foreach ($r in $list) { try { $r.Close() } catch { } }
+            foreach ($r in $list) { try { $r.Dispose() } catch { } }
+        }
+        if (-not $ok) { Write-WarningLog "Runspace teardown timed out; a runspace may still be open" }
     }
     
     # Clear synchronized hashtables
@@ -4685,26 +5211,35 @@ exit
     $performanceHash.Clear()
     $errorSuggestionsHash.Clear()
     $global:CredentialCache.Clear()
+
+    # TEAR DOWN THE SHARED WORKER POOL LAST. The per-computer runspaces above are closed, so no worker
+    # should still be issuing pooled probes; closing the pool here releases its bounded runspaces.
+    # Bounded (Close-WuuWorkerPool) so a probe wedged in an uninterruptible native call cannot hang
+    # teardown; idempotent, so the window-close path may already have closed it.
+    try {
+        if (-not (Close-WuuWorkerPool -TimeoutSeconds 10)) {
+            Write-WarningLog "Worker pool teardown timed out; a pooled probe may still be running"
+        }
+    } catch {
+        Write-WarningLog "Worker pool teardown failed: $($_.Exception.Message)"
+    }
     
-    # Dispose job cleanup runspace
-    if ($jobCleanup.Flag) {
+    # Dispose the job-cleanup runspace. BOUNDED (T008.2): the loop's pipeline may be wedged in an
+    # uninterruptible native call. Ungated on Flag: the window-close path also clears the flag, and a
+    # teardown must not be skipped just because the flag was already lowered.
+    $jcPowerShell = $null; $jcRunspace = $null
+    try { $jcPowerShell = $jobCleanup.PowerShell; $jcRunspace = $jobCleanup.Runspace } catch { }
+    if ($jcPowerShell -or $jcRunspace) {
         Write-InfoLog "Cleaning up job cleanup runspace"
         $jobCleanup.Flag = $False
-        if ($jobCleanup.PowerShell) {
-            try {
-                $jobCleanup.PowerShell.Dispose()
-            } catch {
-                Write-WarningLog "Failed to dispose job cleanup PowerShell: $($_.Exception.Message)"
-            }
+        $ok = Close-WuuBoundedTeardown -ArgumentList @($jcPowerShell, $jcRunspace) -TimeoutSeconds 10 -ScriptBlock {
+            param($p, $r)
+            if ($p) { try { $p.Stop() } catch { } }
+            if ($p) { try { $p.Dispose() } catch { } }
+            if ($r) { try { $r.Close() } catch { } }
+            if ($r) { try { $r.Dispose() } catch { } }
         }
-        if ($jobCleanup.Runspace) {
-            try {
-                $jobCleanup.Runspace.Close()
-                $jobCleanup.Runspace.Dispose()
-            } catch {
-                Write-WarningLog "Failed to cleanup job cleanup runspace: $($_.Exception.Message)"
-            }
-        }
+        if (-not $ok) { Write-WarningLog "Job-cleanup runspace teardown timed out" }
     }
     
     Write-InfoLog "Application shutdown cleanup complete"

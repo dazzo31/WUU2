@@ -11,13 +11,19 @@ $staging = Join-Path $OutputDirectory "staging"
 if (Test-Path $staging) { Remove-Item $staging -Recurse -Force }
 New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
-# Core runnable files + docs
+# Core runnable files + docs.
+#
+# 'ComputerList.config' IS DELIBERATELY ABSENT (defect D4 / T027). It is the operator's real
+# saved fleet - hostnames, phases and credential mode/username metadata - and it was previously
+# listed here, so every release zip disclosed it. Do not re-add it. The staging guard below
+# re-checks the built tree so that re-adding it fails the package instead of leaking silently.
+#
+# 'Exempt.txt' IS DELIBERATELY ABSENT (retired). Legacy PoshPAIG exemption list is no longer shipped.
 $include = @(
     "WUU.ps1",
-    "ComputerList.config",
-    "Exempt.txt",
     "README.md",
     "LICENSE",
+    "NOTICE",
     "Kill-WUU-Processes.ps1"
 )
 
@@ -46,7 +52,7 @@ $scriptsDst = Join-Path $staging "Scripts"
 if (Test-Path $scriptsSrc) {
     Copy-Item -Path $scriptsSrc -Destination $scriptsDst -Recurse -Force
 
-    # Don’t include the packager itself inside the zip (optional, avoids nesting tooling)
+    # Don't include the packager itself inside the zip (optional, avoids nesting tooling)
     $selfInZip = Join-Path $scriptsDst "Package-WUU2.ps1"
     if (Test-Path $selfInZip) { Remove-Item $selfInZip -Force }
 
@@ -65,19 +71,74 @@ Get-ChildItem -Path $repoRoot -Filter "*.md" -File | ForEach-Object {
 $zipPath = Join-Path $OutputDirectory $ZipName
 if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
 
+# -------------------------------------------------------------------------------------------------
+# OPERATOR-DATA GUARD (D4 / T027). FAIL CLOSED, NOT WARN.
+#
+# The staged tree is the exact input to the zip, so refusing here is the last point at which a
+# leak can be stopped. A warning would have let the previous leak ship for months, because the
+# packaging output is success-looking either way; only a hard failure is noticed.
+#
+# The patterns cover operator data (saved lists), credentials, debug/history logs and the
+# dated snapshot scripts that accumulate in the repo root. A release zip has no legitimate
+# reason to contain any of them.
+# -------------------------------------------------------------------------------------------------
+$forbiddenNames = @('ComputerList.config', 'Exempt.txt')
+$forbiddenPatterns = @(
+    'WUU_backup*', 'WUU_updated_backup*', 'WUU_v1.1*',
+    'WUU_debug*', 'WUU_git_version*', 'WUU_perplexity*',
+    '*.log'
+)
+$stagedFiles = @(Get-ChildItem -Path $staging -Recurse -File -ErrorAction SilentlyContinue)
+$leaks = @()
+foreach ($f in $stagedFiles) {
+    if ($forbiddenNames -contains $f.Name) { $leaks += $f.FullName; continue }
+    foreach ($pat in $forbiddenPatterns) {
+        if ($f.Name -like $pat) { $leaks += $f.FullName; break }
+    }
+}
+if ($leaks.Count -gt 0) {
+    $leaks | ForEach-Object { Write-Host "  OPERATOR DATA: $_" -ForegroundColor Red }
+    throw "Packaging refused: $($leaks.Count) operator-data/history file(s) would ship in the zip. Remove them from the include list or the repo before packaging."
+}
+
 # Compress-Archive's constructor intermittently throws (ConstructorInvokedThrowException)
 # when the destination is in the OneDrive-synced dist/ and leaves NO zip behind while
-# still reaching the success message below. Use the proven ZipFile API instead (matches
-# the beta.3 helper) and verify the archive actually exists with a real entry count.
+# still reaching the success message below. Use the ZipFile API instead.
+#
+# BUT NOT `CreateFromDirectory`: on Windows it writes PLATFORM separators, so every nested entry
+# becomes `docs\ARCHITECTURE.md`. The ZIP spec REQUIRES `/`, and a non-Windows extractor takes the name
+# literally - it creates a FILE called `docs\ARCHITECTURE.md` in the extraction root instead of a folder.
+# Measured 2026-10-10: 22 of 27 entries carried a backslash. Entries are therefore created one at a
+# time from the relative path with `/`, and the built archive is re-read to THROW if any backslash
+# survives (a silent regression here ships a subtly broken package that still "succeeds").
 Add-Type -AssemblyName System.IO.Compression.FileSystem
-[IO.Compression.ZipFile]::CreateFromDirectory($staging, $zipPath)
+Add-Type -AssemblyName System.IO.Compression
+$stagingFull = (Resolve-Path $staging).Path.TrimEnd('\', '/')
+$archive = [IO.Compression.ZipFile]::Open($zipPath, [IO.Compression.ZipArchiveMode]::Create)
+try {
+    $stagingFiles = @(Get-ChildItem -Path $stagingFull -Recurse -File)
+    foreach ($file in $stagingFiles) {
+        $relative = $file.FullName.Substring($stagingFull.Length).TrimStart('\', '/')
+        $entryName = $relative -replace '\\', '/'
+        $null = [IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $file.FullName, $entryName, [IO.Compression.CompressionLevel]::Optimal)
+    }
+} finally {
+    $archive.Dispose()
+}
 
 if (-not (Test-Path $zipPath)) {
     throw "Packaging failed: zip was not created at $zipPath"
 }
 $verify = [IO.Compression.ZipFile]::OpenRead($zipPath)
-$entryCount = $verify.Entries.Count
-$verify.Dispose()
+try {
+    $entryCount = $verify.Entries.Count
+    $backslashes = @($verify.Entries | Where-Object { $_.FullName -like '*\*' })
+    if ($backslashes.Count -gt 0) {
+        throw "Packaging refused: $($backslashes.Count) archive entry(ies) use '\' separators. The ZIP spec requires '/' or non-Windows extractors create flat files named 'dir\file'."
+    }
+} finally {
+    $verify.Dispose()
+}
 if ($entryCount -lt 1) { throw "Packaging failed: zip at $zipPath has 0 entries" }
 
 Write-Host "Created package: $zipPath ($entryCount entries)" -ForegroundColor Green

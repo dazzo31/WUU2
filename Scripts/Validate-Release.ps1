@@ -52,4 +52,51 @@ try {
     $failed = $true
 }
 
+# 4. Version constant check (D7)
+$configModule = Join-Path $PSScriptRoot '..\src\Wuu.Configuration.psm1'
+if (Test-Path $configModule) {
+    $configText = Get-Content $configModule -Raw
+    if ($configText -match '\$global:WuuVersion\s*=\s*[''"]([^''"]+)[''"]') {
+        $ver = $matches[1]
+        if ($ver -like '*-cli*') {
+            Write-Host "FAIL: WuuVersion '$ver' carries CLI edition suffix" -ForegroundColor Red
+            $failed = $true
+        } else {
+            Write-Host "PASS: version constant defined: $ver (D7)" -ForegroundColor Green
+        }
+    } else {
+        Write-Host "FAIL: no `$global:WuuVersion constant in Wuu.Configuration.psm1 (D7)" -ForegroundColor Red
+        $failed = $true
+    }
+} else {
+    Write-Host "FAIL: Wuu.Configuration.psm1 not found" -ForegroundColor Red
+    $failed = $true
+}
+
+# 5. Root repository hygiene (Exempt.txt retired)
+if (Test-Path (Join-Path $PSScriptRoot '..\Exempt.txt')) {
+    Write-Host "FAIL: Exempt.txt still present in repo root" -ForegroundColor Red
+    $failed = $true
+} else {
+    Write-Host "PASS: Exempt.txt not in repo root" -ForegroundColor Green
+}
+
+# 6. Packaging script does not include operator data or retired files
+$pkgScript = Join-Path $PSScriptRoot 'Package-WUU2.ps1'
+if (Test-Path $pkgScript) {
+    $pkgText = Get-Content $pkgScript -Raw
+    if ($pkgText -match '(?m)^\s*["'']Exempt\.txt["'']') {
+        Write-Host "FAIL: Package-WUU2.ps1 still includes Exempt.txt in packaging list" -ForegroundColor Red
+        $failed = $true
+    } else {
+        Write-Host "PASS: Package-WUU2.ps1 excludes Exempt.txt" -ForegroundColor Green
+    }
+    if ($pkgText -match '(?m)^\s*["'']ComputerList\.config["'']') {
+        Write-Host "FAIL: Package-WUU2.ps1 includes ComputerList.config in packaging list" -ForegroundColor Red
+        $failed = $true
+    } else {
+        Write-Host "PASS: Package-WUU2.ps1 excludes ComputerList.config (D4)" -ForegroundColor Green
+    }
+}
+
 if ($failed) { exit 1 } else { Write-Host "`nAll validation checks passed" -ForegroundColor Cyan }

@@ -1,0 +1,57 @@
+﻿WUU2 — Windows Update Utility (GUI Edition)
+===========================================
+
+This software is an evolved derivative work based upon multiple open-source
+PowerShell patch management utilities. All upstream projects and this derivative
+work are released under the terms of the MIT License (see LICENSE).
+
+Upstream Lineage & Copyright Attribution:
+------------------------------------------
+
+1. PoshPAIG (PowerShell Patch Audit/Installation GUI)
+   - Initial Release: 2011; GitHub repository established 2014
+   - Author: Boe Prox
+   - Original Repository: CodePlex (poshpaig.codeplex.com) / GitHub (https://github.com/proxb/PoshPAIG)
+   - Copyright: Copyright (c) 2014 Boe Prox
+   - Key contributions retained/descended:
+     * Synchronized runspace collection architecture ($jobs, $jobCleanup, $updatesHash)
+     * Host exclusion list handling (Exempt.txt)
+     * Administrative elevation check patterns
+     * Remote patch check and installation workflow concepts
+
+2. Windows Update Utility (WUU)
+   - Release: December 14, 2016
+   - Author: Tyler Siegrist
+   - Publication: Microsoft TechNet / Script Center (ID 1d72e520) / GitHub (https://github.com/HashGambit97/WindowsUpdateUtility)
+   - Attribution: Documented as a major architectural rewrite of PoshPAIG
+   - Copyright: Copyright (c) 2016 Tyler Siegrist
+   - Key contributions retained/descended:
+     * Consolidation into unified automation scriptblocks ($GetUpdates, $DownloadUpdates, $InstallUpdates)
+     * Native Windows Update Agent (WUA) COM API automation (Microsoft.Update.Session)
+     * WPF/XAML interface design (WUU.xaml, OUPicker.xaml)
+     * Update search query criteria ("IsInstalled=0 and IsHidden=0") and local install loops
+
+3. WUU2
+   - Initial Release: October 2018
+   - Maintainer: HanSolo71
+   - Forum Contributor: Phaere
+   - Repository: GitHub (https://github.com/HanSolo71/WUU2)
+   - Copyright: Copyright (c) 2018 HanSolo71
+   - Key contributions retained/descended:
+     * Runspace scope isolation and stability fixes
+     * Formal publication under the MIT License on GitHub
+
+4. WUU2 (GUI Edition)
+   - Development: 2025–2026
+   - Author: dazzo31
+   - Repository: https://github.com/dazzo31/WUU2
+   - Copyright: Copyright (c) 2025-2026 dazzo31
+   - Key architectural enhancements and new implementations:
+     * Removal of PsExec dependency in favour of temporary SYSTEM scheduled tasks
+     * 5-wave phased deployment engine with automated phase gates
+     * Multi-target custom credential isolation via DCOM CIM sessions
+     * Hardened timeout budgets, deadline floors, and heartbeat monitoring
+     * Thread deadlock fixes across UI dispatcher and worker runspaces
+     * WSUS audit tool integration (Audit-WSUSUpdates.ps1)
+
+For complete details on the migration and code transformation, see docs/PROVENANCE.md.

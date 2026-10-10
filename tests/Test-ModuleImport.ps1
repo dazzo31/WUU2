@@ -16,12 +16,22 @@ try {
     Write-Host 'ALL MODULES IMPORT OK' -ForegroundColor Green
 
     # Verify the key commands the entry point depends on
-    $required = @('Start-WuuApplication','New-WuuErrorSuggestions','Write-DebugLog','Invoke-CimWithTimeout','Show-CredentialConfigDialog','New-ComputerRunspace')
+    $required = @('Start-WuuApplication','New-WuuErrorSuggestions','Write-DebugLog','Invoke-CimWithTimeout','Show-CredentialConfigDialog','New-ComputerRunspace','Initialize-WuuConfiguration')
     foreach ($c in $required) {
         $cmd = Get-Command $c -ErrorAction SilentlyContinue
         if ($cmd) { Write-Host ("OK  {0}  ({1})" -f $c, $cmd.ModuleName) }
-        else { Write-Host ("MISSING  {0}" -f $c) -ForegroundColor Red }
+        else { Write-Host ("MISSING  {0}" -f $c) -ForegroundColor Red; throw "Missing required command: $c" }
     }
+
+    # Verify D7: target-owned version constant is initialized and truthful
+    Initialize-WuuConfiguration -WuuRoot $root
+    if ([string]::IsNullOrWhiteSpace($global:WuuVersion)) {
+        throw "D7 assertion failed: `$global:WuuVersion is empty or not set"
+    }
+    if ($global:WuuVersion -like '*-cli*') {
+        throw "D7 assertion failed: `$global:WuuVersion ('$global:WuuVersion') carries CLI suffix; target must keep its own version"
+    }
+    Write-Host ("OK  `$global:WuuVersion = '{0}' (source: {1}) (D7)" -f $global:WuuVersion, $global:WuuVersionSource) -ForegroundColor Green
 } catch {
     Write-Host ("IMPORT FAILED: " + $_.Exception.Message) -ForegroundColor Red
     throw

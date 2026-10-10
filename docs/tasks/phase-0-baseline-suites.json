@@ -1,0 +1,91 @@
+﻿{
+    "GeneratedAt":  "2026-10-06T08:11:57.0284539+01:00",
+    "RepoRoot":  "C:\\Users\\dazzo\\OneDrive\\GitHub\\WUU2",
+    "TimeoutSec":  120,
+    "Results":  [
+                    {
+                        "Suite":  "Test-AutoFlowChain",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  1.1,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-ColumnResize",
+                        "Verdict":  "STALE",
+                        "ExitCode":  null,
+                        "Seconds":  0,
+                        "Note":  "references removed root WUU.xaml and WUU.ps1 Set-ColumnProportionalWidths; port to ui\\MainWindow.xaml + Wuu.Core wiring (T025/T026)"
+                    },
+                    {
+                        "Suite":  "Test-CredentialTyping",
+                        "Verdict":  "STALE",
+                        "ExitCode":  null,
+                        "Seconds":  0,
+                        "Note":  "import path repaired to Wuu.Remote, but the probes use a real non-routable DCOM host, so each of the 3 calls burns its full 10s timeout + up to 10s stop-wait; needs a fast-failing probe before it can run in CI (T025)"
+                    },
+                    {
+                        "Suite":  "Test-CrossModuleResolution",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.5,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-DragResize",
+                        "Verdict":  "STALE",
+                        "ExitCode":  null,
+                        "Seconds":  0,
+                        "Note":  "references removed root WUU.xaml; drag simulation also blocks without an interactive desktop"
+                    },
+                    {
+                        "Suite":  "Test-LogFaultTolerance",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.7,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-ModuleImport",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.4,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-PendingDrain",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.5,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-RemoteHelpers",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  3.6,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-RemoteTask",
+                        "Verdict":  "SKIP",
+                        "ExitCode":  1,
+                        "Seconds":  0.3,
+                        "Note":  "SKIP: must run elevated (registers a SYSTEM scheduled task)"
+                    },
+                    {
+                        "Suite":  "Test-WorkerPool",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  2.1,
+                        "Note":  ""
+                    }
+                ],
+    "Summary":  {
+                    "Pass":  7,
+                    "Fail":  0,
+                    "Skip":  1,
+                    "Timeout":  0,
+                    "Stale":  3
+                }
+}

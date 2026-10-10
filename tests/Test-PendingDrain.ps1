@@ -53,6 +53,11 @@ $global:PerformanceThreshold = @{ CPUPercent = 80; MemoryMB = 1024; NetworkLaten
 $global:EnableEnhancedErrorHandling = $false
 
 $item = New-Object PSObject -Property @{ Computer = 'localhost'; Phase = 'Phase 1'; Pending = $true; Runspace = $null; Status = 'Initializing...' }
+Set-WuuRowEngineDefaults -Row $item | Out-Null
+$item.Pending = $true
+# The scheduler sources its queue from the ENGINE STORE (T006.1), not the ListView.
+$schedStore = New-WuuStateStore
+Add-WuuComputerRow -Store $schedStore -Row $item | Out-Null
 $fakeItems.Add($item)
 
 $getUpdatesPayload = { param($ComputerItem) 'payload-ran' }
@@ -60,6 +65,7 @@ $getUpdatesPayload = { param($ComputerItem) 'payload-ran' }
 Initialize-WuuWindowsUpdateContext -Context @{
     UiHash                      = $global:uiHash
     Jobs                        = $global:jobs
+    StateStore                  = $schedStore
     UpdatesHash                 = $global:updatesHash
     PerformanceHash             = $global:performanceHash
     ErrorSuggestions            = $global:errorSuggestionsHash
@@ -106,7 +112,10 @@ foreach ($j in @($global:jobs)) {
 }
 
 # Drain a second item to prove the path is repeatable (phase gating sees no blockers)
-$item2 = New-Object PSObject -Property @{ Computer = 'localhost'; Phase = 'Phase 1'; Pending = $true; Runspace = $null; Status = 'Initializing...' }
+$item2 = New-Object PSObject -Property @{ Computer = 'localhost2'; Phase = 'Phase 1'; Pending = $true; Runspace = $null; Status = 'Initializing...' }
+Set-WuuRowEngineDefaults -Row $item2 | Out-Null
+$item2.Pending = $true
+Add-WuuComputerRow -Store $schedStore -Row $item2 | Out-Null
 $fakeItems.Add($item2)
 Start-PendingUpdateCheck
 if ($global:jobs.Count -ge 1) {
@@ -121,5 +130,24 @@ if ($global:jobs.Count -ge 1) {
     Write-Head 'FAIL: second drain empty'
     $fail = $true
 }
+
+# REGRESSION GUARD (T006.1): the scheduler must source its queue from the ENGINE STORE, not the
+# ListView. The ListView now holds DETACHED view rows, so a scheduler that read them would drain nothing
+# (or, worse, submit a view object with no operation identity). This is discriminating: the queued row
+# is registered ONLY in the store, and the ListView is deliberately left EMPTY.
+foreach ($j in @($global:jobs)) { try { $j.PowerShell.Stop() } catch { $null = $_ }; try { $j.PowerShell.Dispose() } catch { $null = $_ }; $global:jobs.Remove($j) }
+$storeOnlyItem = New-Object PSObject -Property @{ Computer = 'store-only'; Phase = 'Phase 1'; Pending = $true; Runspace = $null; Status = 'Initializing...' }
+Set-WuuRowEngineDefaults -Row $storeOnlyItem | Out-Null
+$storeOnlyItem.Pending = $true
+Add-WuuComputerRow -Store $schedStore -Row $storeOnlyItem | Out-Null
+$global:jobs.Clear()
+Start-PendingUpdateCheck
+if ($global:jobs.Count -eq 1) {
+    Write-Host 'PASS: the scheduler drains a row that exists ONLY in the engine store (it reads the store, not the ListView)' -ForegroundColor Green
+} else {
+    Write-Host ("FAIL: the scheduler did not drain the store-only row (jobs={0}) - it is still reading the ListView" -f $global:jobs.Count) -ForegroundColor Red
+    $fail = $true
+}
+foreach ($j in @($global:jobs)) { try { $j.PowerShell.Stop() } catch { $null = $_ }; try { $j.PowerShell.Dispose() } catch { $null = $_ }; $global:jobs.Remove($j) }
 
 if ($fail) { exit 1 } else { Write-Host 'ALL PASS' -ForegroundColor Cyan }

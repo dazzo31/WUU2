@@ -1,8 +1,8 @@
-# WUU2
+﻿# WUU2
 
 Windows Update Utility (WUU) — GUI tool for checking/downloading/installing Windows Updates on remote machines.
 
-This repo is a consolidated/fixed version of the original Windows Update Utility by Tyler Siegrist (PoshPIAG/TechNet) with additional reliability and compatibility improvements.
+This repo is a consolidated/fixed version of the original Windows Update Utility by Tyler Siegrist (PoshPAIG/TechNet) with additional reliability and compatibility improvements.
 
 ## How this fork differs from the original
 
@@ -71,6 +71,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WUU.ps1
 
 Use `Scripts\Package-WUU2.ps1` to generate a zip containing the runnable files + docs.
 
-## Credits / upstream
+## License and Provenance
 
-- Original project: https://gallery.technet.microsoft.com/scriptcenter/Windows-Update-Utility-WUU-1d72e520
+MIT - see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+
+This project is an evolution of open-source PowerShell patch management utilities:
+- **PoshPAIG** (2011–2014) by **Boe Prox** ([GitHub](https://github.com/proxb/PoshPAIG) / CodePlex)
+- **Windows Update Utility / WUU** (2016) by **Tyler Siegrist** ([TechNet](https://gallery.technet.microsoft.com/scriptcenter/Windows-Update-Utility-WUU-1d72e520) / [GitHub](https://github.com/HashGambit97/WindowsUpdateUtility))
+- **WUU2** (2018) by **HanSolo71** with forum fixes by **Phaere** ([GitHub](https://github.com/HanSolo71/WUU2))
+- **WUU2 (GUI Edition)** (2025–2026) by **dazzo31**
+
+For the detailed lineage, architectural evolution, and code ancestry, see [docs/PROVENANCE.md](docs/PROVENANCE.md).
+
+The console/CLI edition of this project lives at <https://github.com/dazzo31/WUU2-CLI>.

@@ -1,0 +1,146 @@
+﻿{
+    "GeneratedAt":  "2026-10-09T08:51:51.6696554+01:00",
+    "RepoRoot":  "C:\\Users\\dazzo\\OneDrive\\GitHub\\WUU2",
+    "TimeoutSec":  120,
+    "Results":  [
+                    {
+                        "Suite":  "Test-AutoFlowChain",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  3.8,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-ColumnResize",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  1.9,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-CredentialContract",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  5.8,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-CredentialDeterminism",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.9,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-CrossModuleResolution",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.6,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-DragResize",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  1.6,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-GuiProjection",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.5,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-LogFaultTolerance",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.8,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-ModuleImport",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.6,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-OperationIdentityLifecycle",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.6,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-PayloadWriterGuard",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.7,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-PendingDrain",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.8,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-RecoveryPath",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  18.2,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-RemoteHelpers",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  6.8,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-RemoteTask",
+                        "Verdict":  "SKIP",
+                        "ExitCode":  1,
+                        "Seconds":  0.3,
+                        "Note":  "SKIP: must run elevated (registers a SYSTEM scheduled task)"
+                    },
+                    {
+                        "Suite":  "Test-StateFencing",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  4.7,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-StateStoreMirror",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  0.8,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-WorkerPool",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  2.3,
+                        "Note":  ""
+                    },
+                    {
+                        "Suite":  "Test-WorkerTwinFence",
+                        "Verdict":  "PASS",
+                        "ExitCode":  0,
+                        "Seconds":  1.4,
+                        "Note":  ""
+                    }
+                ],
+    "Summary":  {
+                    "Pass":  18,
+                    "Fail":  0,
+                    "Skip":  1,
+                    "Timeout":  0
+                }
+}
