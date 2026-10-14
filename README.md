@@ -1,4 +1,7 @@
-﻿# WUU2
+# WUU2
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor-GitHub%20Sponsors-ea4aaa?style=flat&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/dazzo31)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-dazzo31-orange?style=flat&logo=buymeacoffee&logoColor=white)](https://buymeacoffee.com/dazzo31)
 
 Windows Update Utility (WUU) — GUI tool for checking/downloading/installing Windows Updates on remote machines.
 
@@ -70,6 +73,15 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\WUU.ps1
 ## Packaging (zip)
 
 Use `Scripts\Package-WUU2.ps1` to generate a zip containing the runnable files + docs.
+
+## Support & Sponsorship
+
+If WUU2 has saved your fleet time or helped automate patch management across your environment, consider supporting ongoing development:
+
+[![Sponsor on GitHub](https://img.shields.io/badge/Sponsor%20on%20GitHub-ea4aaa?style=for-the-badge&logo=githubsponsors&logoColor=white)](https://github.com/sponsors/dazzo31)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-FFDD00?style=for-the-badge&logo=buymeacoffee&logoColor=black)](https://buymeacoffee.com/dazzo31)
+
+---
 
 ## License and Provenance
 
